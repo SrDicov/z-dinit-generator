@@ -4,14 +4,16 @@ jobs:
   replace:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
     steps:
       - uses: actions/checkout@v5
       - name: corpus
         run: |
           docker pull chimeralinux/chimera:latest
           rm -rf corpus && mkdir corpus
-          docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; find /work/corpus -type f | wc -l'
+          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; find /work/corpus -type f | wc -l'
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |
@@ -23,7 +25,8 @@ jobs:
         run: |
           gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
           tar xzf zinit-v0.0.1-x86_64-unknown-linux-musl.tar.gz
-          zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check out
+          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /work/zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check /work/out'
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
@@ -32,9 +35,9 @@ jobs:
           cp zinit-v0.0.1-x86_64-unknown-linux-musl/zinit zinit-v0.0.1-x86_64-unknown-linux-musl/zctl payload/
           cp -r out payload/out
           docker run -d --name zb \
-            -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
+            -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
             -v "$PWD/payload:/z" \
-            chimeralinux/chimera:latest /z/zinit --init
+            chimeralinux/chimera:latest sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /z/zinit --init'
           sleep 20
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
