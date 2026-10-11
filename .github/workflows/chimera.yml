@@ -11,7 +11,7 @@ jobs:
           docker pull chimeralinux/chimera:latest
           rm -rf corpus && mkdir corpus
           docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk search -q dinit | head -20; echo ---; apk info -L dbus 2>/dev/null | head -30'
+            sh -c 'apk update >/dev/null && apk add dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; find /work/corpus -type f | wc -l'
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |
