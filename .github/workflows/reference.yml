@@ -14,11 +14,14 @@ jobs:
             sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /sbin/dinit'
           sleep 25
           docker exec ref dinitctl list | tee reference-states.txt || true
-          docker exec ref ps aux 2>/dev/null | head -25 || true
-          docker logs ref 2>&1 | tail -20
+          docker exec ref sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " <$p 2>/dev/null | cut -c1-80; echo; done' | sort | uniq -c | sort -rn | tee reference-ps.txt
+          docker logs ref >reference-log.txt 2>&1 || true
           docker rm -f ref
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dinit-reference
-          path: reference-states.txt
+          path: |
+            reference-states.txt
+            reference-ps.txt
+            reference-log.txt

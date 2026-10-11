@@ -22,7 +22,7 @@ jobs:
           printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
           ./dinit-import.sh in out
           grep -q '^type = process$' out/sshd.conf
-          grep -q '^depends = net, opt:log$' out/sshd.conf
+          grep -q '^depends = net, log$' out/sshd.conf
           grep -q '^restart = always$' out/sshd.conf
           grep -q '^log = none$' out/sshd.conf
           grep -q '^stop-timeout = 5s$' out/sshd.conf
