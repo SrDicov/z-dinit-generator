@@ -37,7 +37,7 @@ jobs:
           rm -rf payload && mkdir payload
           cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
           cp -r out payload/out
-          docker run -d --name zb \
+          docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
             -v "$PWD/payload:/z" \
             chimeralinux/chimera:latest sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /z/zinit --init'
