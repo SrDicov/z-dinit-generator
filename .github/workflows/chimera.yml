@@ -16,7 +16,7 @@ jobs:
           docker pull chimeralinux/chimera:latest
           rm -rf corpus && mkdir corpus
           docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; cp -r /usr/lib/dinit.d/early/scripts /work/corpus-scripts 2>/dev/null; find /work/corpus -type f | wc -l'
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp -r "$d"/* "/work/corpus/$(basename $d)/"; }; done; cp -r /usr/lib/dinit.d/early/scripts /work/corpus-scripts 2>/dev/null; find /work/corpus -type f -o -type l | wc -l'
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |

@@ -2,7 +2,9 @@
 # dinit-import.sh <dinitdir> <outdir>: dinit -> zinit, texto a texto.
 # depends-ms/waits-for/after=>opt:; bgprocess sin pid=>process;
 # internal/triggered=>oneshot true (target no admite depends, E011);
-# restart bool=>always/never; resto se avisa y se omite.
+# ready-notification=>notify; before X=>X depends de mi (2 pasadas);
+# *-d.waits=>opt:, *-d.depends=>required; restart bool=>always/never;
+# resto se avisa y se omite.
 # Salida: 0 (saltos son avisos), 1 fallo E/S, 2 uso. POSIX sh.
 set -eu
 p=dinit-import
@@ -11,12 +13,14 @@ warn() { printf '%s: %s\n' "$p" "$*" >&2; }
 in=$1 out=$2
 [ -d "$in" ] || { warn "$in: not a directory"; exit 1; }
 mkdir -p "$out" || exit 1
+bef=${TMPDIR:-/tmp}/$p.before.$$
+: >"$bef" || exit 1
 squote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 t() { printf '%s' "$1" | sed 's/^ *//;s/ *$//'; }
 dur() { case "$1" in *[!0-9]*) printf '%s' "$1";; *) printf '%ss' "$1";; esac; }
 convert() {
     f=$1 n=$2
-    type= command= deps= restart= stop= start= user= wdir= log= pid=
+    type= command= deps= restart= stop= start= user= wdir= log= pid= ready=
     tmp=${TMPDIR:-/tmp}/$p.$$
     sed -e 's/#.*$//' -e '/^ *$/d' "$f" >"$tmp" || return 1
     while IFS= read -r ln; do
@@ -27,6 +31,16 @@ convert() {
             command) if [ "$ap" = 1 ]; then command="$command $v"; else command=$v; fi;;
             depends-on) deps=${deps:+"$deps, "}$v;;
             depends-ms|waits-for|after) deps=${deps:+"$deps, "}opt:$v;;
+            before) printf '%s %s\n' "$v" "$n" >>"$bef" || return 1;;
+            depends-on.d|depends-ms.d|waits-for.d)
+                case "$k" in depends-on.d) pre=;; *) pre=opt:;; esac
+                dd=$v; bn=$(basename "$dd")
+                if [ -d "$in/$bn" ]; then dd=$in/$bn; fi
+                if [ -d "$dd" ]; then for e in "$dd"/*; do
+                    [ -e "$e" ] || continue
+                    deps=${deps:+"$deps, "}$pre$(basename "$e")
+                done; else warn "$n: $k $v missing, ignored"; fi;;
+            ready-notification) ready=notify;;
             restart) case "$v" in true|yes|1) restart=always;; false|no|0) restart=never;; *) warn "$n: restart=$v ignored";; esac;;
             stop-timeout) stop=$(dur "$v");;
             start-timeout) start=$(dur "$v");;
@@ -56,9 +70,21 @@ convert() {
         [ -z "$start" ] || printf 'start-timeout = %s\n' "$start"
         [ -z "$user" ] || printf 'user = %s\n' "$user"
         [ -z "$log" ] || printf 'log = %s\n' "$log"
+        [ -z "$ready" ] || printf 'ready = %s\n' "$ready"
         [ "$zt" = forking ] && [ -n "$pid" ] && printf 'pid-file = %s\n' "$pid"
         :
     } >"$out/$n.conf" || { warn "cannot write $out/$n.conf"; return 1; }
+}
+add_req() {
+    [ -f "$out/$1.conf" ] || { warn "$2: before $1 unknown, ignored"; return 0; }
+    pw=${TMPDIR:-/tmp}/$p.patch.$$
+    hit=0
+    while IFS= read -r l; do
+        case "$l" in "depends = "*) l="depends = $2, ${l#depends = }"; hit=1;; esac
+        printf '%s\n' "$l"
+    done <"$out/$1.conf" >"$pw" || return 1
+    [ "$hit" = 1 ] || printf 'depends = %s\n' "$2" >>"$pw" || return 1
+    mv "$pw" "$out/$1.conf" || return 1
 }
 for f in "$in"/*; do
     [ -e "$f" ] || continue
@@ -67,3 +93,5 @@ for f in "$in"/*; do
     case "$n" in *[!a-zA-Z0-9_.@+-]*|""|.*|@*|*@|*..*|*@*@*) warn "$n: odd name, skipped"; continue;; esac
     convert "$f" "$n" || exit 1
 done
+while read -r b a; do [ -n "${b:-}" ] && [ -n "${a:-}" ] && add_req "$b" "$a" || exit 1; done <"$bef"
+rm -f "$bef"
