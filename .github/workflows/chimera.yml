@@ -50,6 +50,7 @@ jobs:
           sleep 5
           docker exec zb cat /z/probe.done | tee probe.txt
           grep -q '^ok$' probe.txt
+          docker exec zb timeout 8 /usr/bin/chronyd -n -u _chrony -N 11 2>&1 | head -15 || true
           docker logs zb >zb.log 2>&1 || true
           tail -5 zb.log
           docker rm -f zb
