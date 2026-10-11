@@ -44,7 +44,9 @@ jobs:
           sleep 20
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
-          docker logs zb 2>&1 | tail -15
+          for s in sshd dbus-daemon chronyd boot system early-cryptdisks; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          docker logs zb >zb.log 2>&1 || true
+          tail -5 zb.log
           docker rm -f zb
       - uses: actions/upload-artifact@v4
         if: always()
@@ -54,3 +56,5 @@ jobs:
             out
             warn.log
             states.txt
+            status.txt
+            zb.log
