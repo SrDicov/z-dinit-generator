@@ -49,6 +49,7 @@ jobs:
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl reload-all
           sleep 5
           docker exec zb cat /z/probe.done | tee probe.txt
+          grep -q '^ok$' probe.txt
           docker logs zb >zb.log 2>&1 || true
           tail -5 zb.log
           docker rm -f zb
@@ -57,6 +58,7 @@ jobs:
         with:
           name: chimera-e2e
           path: |
+            corpus
             out
             warn.log
             states.txt
