@@ -24,16 +24,21 @@ jobs:
           grep -q '^type = process$' out/sshd.conf
           grep -q '^depends = net, log$' out/sshd.conf
           grep -q '^restart = always$' out/sshd.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/sshd.conf
           grep -q '^log = none$' out/sshd.conf
           grep -q '^stop-timeout = 5s$' out/sshd.conf
           grep -q '^type = oneshot$' out/fs.conf
           grep -q '^command = true$' out/boot.conf
           grep -q '^depends = sshd$' out/boot.conf
           grep -q '^pid-file = /run/m.pid$' out/mysql.conf
+          grep -q '^restart = always$' out/mysql.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/mysql.conf
           grep -q '^depends = net$' out/notifier.conf
           grep -q '^depends = opt:notifier$' out/log.conf
           grep -q '^ready = notify$' out/notifier.conf
           grep -q '^command = exec 5>&\$ZINIT_NOTIFY_FD; exec /bin/daemon$' out/notifier.conf
+          grep -q '^restart = always$' out/notifier.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/notifier.conf
           ! grep -q '^restart' out/boot.conf
       - name: c1
         run: |

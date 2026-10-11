@@ -3,10 +3,11 @@
 # depends-on/ms=>required (ms pierde el corte post-arranque);
 # waits-for/after=>opt: (ordena sin bloquear); before X=>opt: en X;
 # bgprocess sin pid=>process; internal/triggered=>oneshot true (E011);
-# ready-notification=>notify, sin ella=>none (dinit arranca en exec;
-# el defecto notify de zinit colaria 30 s por demonio); restart ausente
-# reintenta acotado 3/10s y zinit always es infinito: omitir acota
-# igual; on-failure=>igual salvo oneshot=>never; sin logfile=>none;
+# ready-notification=>notify+preambulo fd, sin ella=>none (dinit
+# arranca en exec; el defecto notify colaria 30 s por demonio);
+# restart ausente/true en proceso=>always+`3 restarts per 10s`
+# (envolvente dinit: el always solo de zinit es infinito);
+# on-failure=>igual salvo oneshot=>never; sin logfile=>none;
 # *-d depends=>required, *-d waits/ms=>opt:; resto se avisa y se omite.
 # Salida: 0 (saltos son avisos), 1 fallo E/S, 2 uso. POSIX sh.
 set -eu
@@ -23,7 +24,7 @@ t() { printf '%s' "$1" | sed 's/^ *//;s/ *$//'; }
 dur() { case "$1" in *[!0-9]*) printf '%s' "$1";; *) printf '%ss' "$1";; esac; }
 convert() {
     f=$1 n=$2
-    type= command= deps= restart= stop= start= user= wdir= log= pid= ready= notifyfd=
+    type= command= deps= restart= budget= stop= start= user= wdir= log= pid= ready= notifyfd=
     tmp=${TMPDIR:-/tmp}/$p.$$
     sed -e 's/#.*$//' -e '/^ *$/d' "$f" >"$tmp" || return 1
     while IFS= read -r ln; do
@@ -49,6 +50,7 @@ convert() {
                     case "$nfd" in ''|*[!0-9]*) warn "$n: ready $v ignored";; *) notifyfd=$nfd;; esac;;
                 *) warn "$n: ready $v ignored";; esac;;
             restart) case "$v" in true|yes|1) restart=always;; false|no|0) restart=never;; on-failure) restart=on-failure;; *) warn "$n: restart=$v ignored";; esac;;
+            restart-delay|restart-limit-*) warn "$n: $k ignored; 3-per-10s envelope used";;
             stop-timeout) stop=$(dur "$v");;
             start-timeout) start=$(dur "$v");;
             run-as) user=$v;;
@@ -81,6 +83,18 @@ convert() {
     case "$zt" in
         oneshot) [ "$restart" = on-failure ] && restart=never;;
     esac
+    # dinit restarts by default, bounded 3-per-10s. zinit always is
+    # unbounded (devmon spun 316x), so every always carries the dinit
+    # envelope explicitly. Absent restart on process/bgprocess means the
+    # dinit default: always, bounded. (tmpfiles-clean proved clean exits
+    # must re-arm: it sleeps 900 s, cleans, exits 0, repeats.)
+    if [ "$restart" = always ]; then
+        budget='3 restarts per 10s'
+    else
+        case "$zt" in
+            process|forking|script) [ -n "$restart" ] || { restart=always; budget='3 restarts per 10s'; };;
+        esac
+    fi
     [ -n "$log" ] || log=none
     # dinit without ready-notification starts at exec; zinit default is
     # notify (30 s artificial delay per daemon), so spell none out.
@@ -90,6 +104,7 @@ convert() {
         printf 'command = %s\n' "$command"
         [ -z "$deps" ] || printf 'depends = %s\n' "$deps"
         [ -z "$restart" ] || printf 'restart = %s\n' "$restart"
+        [ -z "$budget" ] || printf 'restart-budget = %s\n' "$budget"
         [ -z "$stop" ] || printf 'stop-timeout = %s\n' "$stop"
         [ -z "$start" ] || printf 'start-timeout = %s\n' "$start"
         [ -z "$user" ] || printf 'user = %s\n' "$user"
