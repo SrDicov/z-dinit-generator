@@ -14,6 +14,8 @@ jobs:
           printf 'type = scripted\ncommand = /s/fs.sh\nrestart = false\n' > in/fs
           printf 'type = internal\ndepends-on = sshd\n' > in/boot
           printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
           ./dinit-import.sh in out
           grep -q '^type = process$' out/sshd.conf
           grep -q '^depends = net, opt:log$' out/sshd.conf
