@@ -6,7 +6,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: syntax
-        run: sh -n dinit-import.sh
+        run: |
+          sh -n dinit-import.sh
+          sh -n dinitctl
+          sh test/test-dinitctl.sh
       - name: fixtures
         run: |
           rm -rf in out && mkdir in out
@@ -16,15 +19,22 @@ jobs:
           printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
           printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
           printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
+          printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
           ./dinit-import.sh in out
           grep -q '^type = process$' out/sshd.conf
           grep -q '^depends = net, opt:log$' out/sshd.conf
           grep -q '^restart = always$' out/sshd.conf
+          grep -q '^log = none$' out/sshd.conf
           grep -q '^stop-timeout = 5s$' out/sshd.conf
           grep -q '^type = oneshot$' out/fs.conf
           grep -q '^command = true$' out/boot.conf
           grep -q '^depends = sshd$' out/boot.conf
           grep -q '^pid-file = /run/m.pid$' out/mysql.conf
+          grep -q '^depends = net$' out/notifier.conf
+          grep -q '^depends = opt:notifier$' out/log.conf
+          grep -q '^ready = notify$' out/notifier.conf
+          grep -q '^command = exec 5>&\$ZINIT_NOTIFY_FD; exec /bin/daemon$' out/notifier.conf
+          ! grep -q '^restart' out/boot.conf
       - name: c1
         run: |
           gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
