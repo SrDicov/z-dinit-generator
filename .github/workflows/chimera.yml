@@ -35,12 +35,12 @@ jobs:
       - name: boot
         run: |
           rm -rf payload && mkdir payload
-          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
+          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" dinitctl payload/
           cp -r out payload/out
           docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
             -v "$PWD/payload:/z" \
-            chimeralinux/chimera:latest sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /z/zinit --init'
+            chimeralinux/chimera:latest sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && mv /usr/bin/dinitctl /usr/bin/dinitctl.real && cp /z/dinitctl /usr/bin/dinitctl && chmod +x /usr/bin/dinitctl && exec /z/zinit --init'
           sleep 20
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
@@ -50,7 +50,7 @@ jobs:
           sleep 5
           docker exec zb cat /z/probe.done | tee probe.txt
           grep -q '^ok$' probe.txt
-          docker exec zb timeout 8 /usr/bin/chronyd -n -u _chrony -N 11 2>&1 | head -15 || true
+          docker exec zb sh -c '/usr/bin/chronyd -n -u _chrony -N 11 >/tmp/chrony.out 2>&1 & p=$!; sleep 6; kill -9 $p 2>/dev/null; cat /tmp/chrony.out' 2>&1 | head -15 || true
           docker logs zb >zb.log 2>&1 || true
           tail -5 zb.log
           docker rm -f zb
