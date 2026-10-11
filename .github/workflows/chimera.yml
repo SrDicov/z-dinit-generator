@@ -1,0 +1,49 @@
+name: chimera-e2e
+on: [push, pull_request]
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: corpus
+        run: |
+          docker pull chimeralinux/chimera:latest
+          rm -rf corpus && mkdir corpus
+          docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && cp -r "$d" "/work/corpus/$(basename $d)"; done; find /work/corpus -type f | wc -l'
+      - name: translate
+        run: |
+          rm -rf out && mkdir out && rm -f warn.log && touch warn.log
+          for d in corpus/*/; do ./dinit-import.sh "$d" out 2>>warn.log || exit 1; done
+          echo "files=$(find corpus -type f | wc -l) generated=$(ls out | wc -l)"
+          sort warn.log | uniq -c | sort -rn | head -20
+      - name: c1
+        run: |
+          gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
+          tar xzf zinit-v0.0.1-x86_64-unknown-linux-musl.tar.gz
+          zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check out
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: boot
+        run: |
+          rm -rf payload && mkdir payload
+          cp zinit-v0.0.1-x86_64-unknown-linux-musl/zinit zinit-v0.0.1-x86_64-unknown-linux-musl/zctl payload/
+          cp -r out payload/out
+          docker run -d --name zb \
+            -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
+            -v "$PWD/payload:/z" \
+            chimeralinux/chimera:latest /z/zinit --init
+          sleep 20
+          test "$(docker inspect -f '{{.State.Running}}' zb)" = true
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
+          docker logs zb 2>&1 | tail -15
+          docker rm -f zb
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chimera-e2e
+          path: |
+            out
+            warn.log
+            states.txt
