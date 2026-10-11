@@ -11,7 +11,7 @@ jobs:
           docker pull chimeralinux/chimera:latest
           rm -rf corpus && mkdir corpus
           docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add openssh dbus chrony >/dev/null && apk info -L openssh dbus chrony dinit 2>/dev/null | grep -i -e dinit | head -20; ls /etc/ | head -30'
+            sh -c 'apk update >/dev/null && apk search -q dinit | head -20; echo ---; apk info -L dbus 2>/dev/null | head -30'
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |
