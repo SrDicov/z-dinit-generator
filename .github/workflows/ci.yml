@@ -1,0 +1,32 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: syntax
+        run: sh -n dinit-import.sh
+      - name: fixtures
+        run: |
+          rm -rf in out && mkdir in out
+          printf 'type = process\ncommand = /usr/sbin/sshd -D\ndepends-on = net\ndepends-ms = log\nrestart = true\nstop-timeout = 5\n' > in/sshd
+          printf 'type = scripted\ncommand = /s/fs.sh\nrestart = false\n' > in/fs
+          printf 'type = internal\ndepends-on = sshd\n' > in/boot
+          printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
+          ./dinit-import.sh in out
+          grep -q '^type = process$' out/sshd.conf
+          grep -q '^depends = net, opt:log$' out/sshd.conf
+          grep -q '^restart = always$' out/sshd.conf
+          grep -q '^stop-timeout = 5s$' out/sshd.conf
+          grep -q '^type = oneshot$' out/fs.conf
+          grep -q '^command = true$' out/boot.conf
+          grep -q '^depends = sshd$' out/boot.conf
+          grep -q '^pid-file = /run/m.pid$' out/mysql.conf
+      - name: c1
+        run: |
+          gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
+          tar xzf zinit-v0.0.1-x86_64-unknown-linux-musl.tar.gz
+          zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check out
+        env:
+          GH_TOKEN: ${{ github.token }}
