@@ -6,6 +6,9 @@ jobs:
     timeout-minutes: 15
     env:
       PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
+      ZINIT_VER: v0.0.2
+      ZINIT_TGZ: zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
+      ZINIT_DIR: zinit-v0.0.2-x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v5
       - name: corpus
@@ -23,16 +26,16 @@ jobs:
           sort warn.log | uniq -c | sort -rn | head -20
       - name: c1
         run: |
-          gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
-          tar xzf zinit-v0.0.1-x86_64-unknown-linux-musl.tar.gz
-          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /work/zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check /work/out'
+          gh release download "$ZINIT_VER" -R SrDicov/zinit --pattern '*x86_64*'
+          tar xzf "$ZINIT_TGZ"
+          docker run --rm -e PKGS -e ZINIT_DIR -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /work/$ZINIT_DIR/zinit check /work/out'
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
         run: |
           rm -rf payload && mkdir payload
-          cp zinit-v0.0.1-x86_64-unknown-linux-musl/zinit zinit-v0.0.1-x86_64-unknown-linux-musl/zctl payload/
+          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
           cp -r out payload/out
           docker run -d --name zb \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
