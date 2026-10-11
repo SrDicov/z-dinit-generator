@@ -16,7 +16,7 @@ jobs:
           docker pull chimeralinux/chimera:latest
           rm -rf corpus && mkdir corpus
           docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; find /work/corpus -type f | wc -l'
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp "$d"/* "/work/corpus/$(basename $d)/"; }; done; cp -r /usr/lib/dinit.d/early/scripts /work/corpus-scripts 2>/dev/null; find /work/corpus -type f | wc -l'
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |
@@ -45,6 +45,10 @@ jobs:
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
           for s in sshd dbus-daemon chronyd boot system early-cryptdisks; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          docker exec zb sh -c "printf 'type = script\ncommand = echo ok > /z/probe.done\nready = none\nrestart = never\nlog = none\n' > /z/out/probe.conf"
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl reload-all
+          sleep 5
+          docker exec zb cat /z/probe.done | tee probe.txt
           docker logs zb >zb.log 2>&1 || true
           tail -5 zb.log
           docker rm -f zb
@@ -57,4 +61,6 @@ jobs:
             warn.log
             states.txt
             status.txt
+            probe.txt
             zb.log
+            corpus-scripts
