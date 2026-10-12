@@ -77,7 +77,9 @@ convert() {
     fi
     # s6-style pipefd:N: the service writes readiness to fd N, but zinit
     # listens on $ZINIT_NOTIFY_FD, so a shell prelude dups it over. Any
-    # byte readies (legacy rule), which is exactly what such writers emit.
+    # non-blank byte readies (legacy rule); a bare newline does not, it
+    # falls back to the ready timeout. N > 9 needs multi-digit fd
+    # redirection in /bin/sh (Chimera stock sh stops at 9).
     # Wrapping precedes the cd: `exec cd` would replace the shell instead.
     if [ -n "$wdir" ]; then command="cd $(squote "$wdir") && $command"; fi
     case "$zt" in
