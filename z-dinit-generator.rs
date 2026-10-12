@@ -42,7 +42,7 @@ fn warn(msg: &str) {
 fn usage() -> i32 {
     eprintln!(
         "usage: z-dinit-generator <convert|watch|dinitctl|compatd|start> [...]\n\
-         convert <dinitdir> <outdir> | watch <dinitdir> <outdir> |\n\
+         convert <dinitdir> <outdir> | watch <dinitdir>... <outdir> |\n\
          dinitctl <cmd> [args] | compatd [/run/dinitctl] | start [--out DIR]"
     );
     2
@@ -894,34 +894,48 @@ fn fingerprint(dir: &std::path::Path) -> BTreeMap<String, (u64, u64)> {
     m
 }
 
-fn cmd_watch(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
-    if !in_dir.is_dir() {
-        warn(&format!("{}: not a directory", in_dir.display()));
-        return 1;
+fn cmd_watch(in_dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i32 {
+    for d in in_dirs {
+        if !d.is_dir() {
+            warn(&format!("{}: not a directory", d.display()));
+            return 1;
+        }
     }
     let sock = zinit_socket(None);
-    let mut last = fingerprint(in_dir);
+    let mut last = fingerprints(in_dirs);
     // initial convert so the daemon is the source of truth from second zero.
-    if cmd_convert_quiet(in_dir, out_dir) != 0 {
-        return 1;
+    for d in in_dirs {
+        if cmd_convert(d, out_dir) != 0 {
+            return 1;
+        }
     }
     c4_reload(&sock);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let cur = fingerprint(in_dir);
+        let cur = fingerprints(in_dirs);
         if cur != last {
             last = cur;
-            if cmd_convert_quiet(in_dir, out_dir) == 0 {
+            let mut ok = true;
+            for d in in_dirs {
+                if cmd_convert(d, out_dir) != 0 {
+                    ok = false;
+                }
+            }
+            if ok {
                 c4_reload(&sock);
             }
         }
     }
 }
 
-fn cmd_convert_quiet(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
-    // Same as cmd_convert but warns still go to stderr (Unix: daemon is
-    // silent only when there is nothing to say).
-    cmd_convert(in_dir, out_dir)
+fn fingerprints(dirs: &[std::path::PathBuf]) -> BTreeMap<String, (u64, u64)> {
+    let mut m = BTreeMap::new();
+    for dir in dirs {
+        for (k, v) in fingerprint(dir) {
+            m.insert(format!("{}:{}", dir.display(), k), v);
+        }
+    }
+    m
 }
 
 // ---------- start (live switch) ----------
@@ -941,21 +955,11 @@ fn cmd_start(out: Option<&str>) -> i32 {
         return 1;
     }
     // usr first so etc wins on overlay.
-    let mut n = 0;
     for d in &found {
-        let before = match std::fs::read_dir(&outp) {
-            Ok(r) => r.count(),
-            Err(_) => 0,
-        };
         let rc = cmd_convert(d, &outp);
         if rc != 0 {
             return 1;
         }
-        let after = match std::fs::read_dir(&outp) {
-            Ok(r) => r.count(),
-            Err(_) => 0,
-        };
-        n += after.saturating_sub(before);
     }
     // compatd service so devmon-speaking helpers keep working.
     let exe = std::env::current_exe()
@@ -983,7 +987,7 @@ fn cmd_start(out: Option<&str>) -> i32 {
         warn("cannot write dinit-watch.conf");
         return 1;
     }
-    println!("converted {} services -> {}", n.max(converted_count(&outp)), outdir);
+    println!("converted {} services -> {}", converted_count(&outp), outdir);
     println!("next: remove dinit, reboot on zinit");
     0
 }
@@ -1022,11 +1026,14 @@ fn main() -> std::process::ExitCode {
             }
         }
         "watch" => {
-            if args.len() != 2 {
-                eprintln!("usage: z-dinit-generator watch <dinitdir> <outdir>");
+            if args.len() < 2 {
+                eprintln!("usage: z-dinit-generator watch <dinitdir>... <outdir>");
                 2
             } else {
-                cmd_watch(std::path::Path::new(&args[0]), std::path::Path::new(&args[1]))
+                let out = std::path::PathBuf::from(args.last().unwrap());
+                let ins: Vec<std::path::PathBuf> =
+                    args[..args.len() - 1].iter().map(std::path::PathBuf::from).collect();
+                cmd_watch(&ins, &out)
             }
         }
         "dinitctl" => cmd_dinitctl(&args),
