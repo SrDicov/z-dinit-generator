@@ -1,5 +1,8 @@
 #!/bin/sh
 # dinit-import.sh <dinitdir> <outdir>: dinit -> zinit, texto a texto.
+# Arranque perezoso como dinit: solo boot y lo que arrastra (required +
+# waits + .d; after/before nunca arrastran) arranca solo; el resto sale
+# con `enabled = no` para arranque explícito del operador.
 # depends-on/ms=>required (ms pierde el corte post-arranque);
 # waits-for/after=>opt: (ordena sin bloquear); before X=>opt: en X;
 # bgprocess sin pid=>process; internal/triggered=>oneshot true (E011);
@@ -22,6 +25,9 @@ in=$1 out=$2
 mkdir -p "$out" || exit 1
 bef=${TMPDIR:-/tmp}/$p.before.$$
 : >"$bef" || exit 1
+pulldir=${TMPDIR:-/tmp}/$p.pulls.$$
+mkdir -p "$pulldir" || exit 1
+pull() { printf '%s\n' "$2" >>"$pulldir/$1" || return 1; }
 squote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 t() { printf '%s' "$1" | sed 's/^ *//;s/ *$//'; }
 dur() { case "$1" in *[!0-9]*) printf '%s' "$1";; *) printf '%ss' "$1";; esac; }
@@ -37,8 +43,9 @@ convert() {
         case "$k" in
             type) type=$v;;
             command) if [ "$ap" = 1 ]; then command="$command $v"; else command=$v; fi;;
-            depends-on|depends-ms) deps=${deps:+"$deps, "}$v;;
-            waits-for|after) deps=${deps:+"$deps, "}opt:$v;;
+            depends-on|depends-ms) deps=${deps:+"$deps, "}$v; pull "$n" "$v" || return 1;;
+            waits-for) deps=${deps:+"$deps, "}opt:$v; pull "$n" "$v" || return 1;;
+            after) deps=${deps:+"$deps, "}opt:$v;;
             before) printf '%s %s\n' "$v" "opt:$n" >>"$bef" || return 1;;
             depends-on.d|depends-ms.d|waits-for.d)
                 case "$k" in depends-on.d) pre=;; *) pre=opt:;; esac
@@ -47,6 +54,7 @@ convert() {
                 if [ -d "$dd" ]; then for e in "$dd"/*; do
                     [ -e "$e" ] || continue
                     deps=${deps:+"$deps, "}$pre$(basename "$e")
+                    pull "$n" "$(basename "$e")" || return 1
                 done; else warn "$n: $k $v missing, ignored"; fi;;
             ready-notification)
                 ready=notify
@@ -169,3 +177,31 @@ for f in "$in"/*; do
 done
 while read -r b a; do [ -n "${b:-}" ] && [ -n "${a:-}" ] && add_req "$b" "$a" || exit 1; done <"$bef"
 rm -f "$bef"
+# Boot closure: dinit starts lazily (boot + what it pulls), never the
+# whole directory. Services outside the closure boot disabled, like
+# un-enabled dinit services: the operator starts them explicitly.
+# Pulls = required + waits + .d (all start their deps); after/before
+# never pull. BFS from boot over recorded pull lists.
+if [ -f "$in/boot" ]; then
+    work=${TMPDIR:-/tmp}/$p.work.$$ closed=${TMPDIR:-/tmp}/$p.closed.$$
+    printf 'boot\n' >"$work" || exit 1
+    : >"$closed" || exit 1
+    while IFS= read -r s || [ -n "$s" ]; do
+        case "$s" in ""|"#"*) continue;; esac
+        grep -qxF "$s" "$closed" 2>/dev/null && continue
+        printf '%s\n' "$s" >>"$closed" || exit 1
+        [ -f "$pulldir/$s" ] && while IFS= read -r d || [ -n "$d" ]; do
+            case "$d" in ""|"#"*) continue;; esac
+            grep -qxF "$d" "$closed" 2>/dev/null || printf '%s\n' "$d" >>"$work" || exit 1
+        done <"$pulldir/$s"
+    done <"$work"
+    for f in "$out"/*.conf; do
+        [ -e "$f" ] || continue
+        n=$(basename "$f" .conf)
+        grep -qxF "$n" "$closed" 2>/dev/null || printf 'enabled = no\n' >>"$f" || exit 1
+    done
+    rm -f "$work" "$closed"
+else
+    warn "no boot service; everything enabled"
+fi
+rm -rf "$pulldir"

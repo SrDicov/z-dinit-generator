@@ -23,6 +23,8 @@ jobs:
           printf 'type = process\ncommand = /bin/sleep 300\nstop-command = /bin/echo bye\n' > in/graceful
           printf 'type = process\ncommand = /bin/true\nrestart = false\nchain-to = done2\n' > in/chainer
           printf 'type = scripted\ncommand = /bin/true\nstop-command = /bin/echo x\nchain-to = done2\n' > in/ochain
+          printf 'type = internal\n' > in/boot2
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/lonely
           ./dinit-import.sh in out 2>warn.txt || exit 1
           grep -q 'chain-to needs a shell' warn.txt
           grep -q 'stop-command needs a shell' warn.txt
@@ -51,6 +53,10 @@ jobs:
           grep -q '^type = oneshot$' out/ochain.conf
           grep -q '^command = /bin/true$' out/ochain.conf
           ! grep -q '^restart' out/boot.conf
+          grep -q '^enabled = no$' out/lonely.conf
+          grep -q '^enabled = no$' out/mysql.conf
+          ! grep -q '^enabled' out/sshd.conf
+          ! grep -q '^enabled' out/boot.conf
       - name: c1
         run: |
           gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*'
