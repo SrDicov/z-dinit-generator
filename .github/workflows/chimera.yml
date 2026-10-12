@@ -11,6 +11,7 @@ jobs:
       ZINIT_DIR: zinit-v0.0.2-x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - name: corpus
         run: |
           docker pull chimeralinux/chimera:latest
@@ -20,9 +21,11 @@ jobs:
           test "$(find corpus -type f | wc -l)" -gt 0
       - name: translate
         run: |
-          rm -rf out && mkdir out && rm -f warn.log && touch warn.log
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+          rm -rf out out-rs && mkdir out out-rs && rm -f warn.log && touch warn.log
           for d in corpus/*/; do ./dinit-import.sh "$d" out 2>>warn.log || exit 1; done
-          echo "files=$(find corpus -type f | wc -l) generated=$(ls out | wc -l)"
+          for d in corpus/*/; do /tmp/zdg convert "$d" out-rs 2>/dev/null || exit 1; done
+          echo "files=$(find corpus -type f | wc -l) generated=$(ls out | wc -l) rust=$(ls out-rs | wc -l)"
           sort warn.log | uniq -c | sort -rn | head -20
       - name: c1
         run: |
@@ -30,12 +33,15 @@ jobs:
           tar xzf "$ZINIT_TGZ"
           docker run --rm -e PKGS -e ZINIT_DIR -v "$PWD:/work" chimeralinux/chimera:latest \
             sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /work/$ZINIT_DIR/zinit check /work/out'
+          docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'exec /work/$ZINIT_DIR/zinit check /work/out-rs'
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
         run: |
           rm -rf payload && mkdir payload
-          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" dinitctl payload/
+          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
+          cp /tmp/zdg payload/dinitctl
           cp -r out payload/out
           docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
@@ -66,6 +72,7 @@ jobs:
           path: |
             corpus
             out
+            out-rs
             warn.log
             states.txt
             status.txt
