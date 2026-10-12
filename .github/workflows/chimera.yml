@@ -32,9 +32,7 @@ jobs:
           gh release download "$ZINIT_VER" -R SrDicov/zinit --pattern '*x86_64*'
           tar xzf "$ZINIT_TGZ"
           docker run --rm -e PKGS -e ZINIT_DIR -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /work/$ZINIT_DIR/zinit check /work/out'
-          docker run --rm -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'exec /work/$ZINIT_DIR/zinit check /work/out-rs'
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && /work/$ZINIT_DIR/zinit check /work/out && exec /work/$ZINIT_DIR/zinit check /work/out-rs'
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
