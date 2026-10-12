@@ -39,8 +39,7 @@ jobs:
         run: |
           rm -rf payload && mkdir payload
           cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
-          cp /tmp/zdg payload/dinitctl
-          cp /tmp/zdg payload/z-dinit-generator
+          cp z-dinit-generator.rs payload/
           cp -r out payload/out
           printf 'type = process\ncommand = /z/z-dinit-generator compatd\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n' > payload/out/compatd.conf
           if [ -f payload/out/early-devmon.conf ]; then
@@ -50,6 +49,8 @@ jobs:
               printf 'depends = compatd\n' >> payload/out/early-devmon.conf
             fi
           fi
+          docker run --rm -v "$PWD/payload:/z" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add rust >/dev/null && rustc -O --edition=2021 /z/z-dinit-generator.rs -o /z/z-dinit-generator && cp /z/z-dinit-generator /z/dinitctl && rm /z/z-dinit-generator.rs'
           docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
             -v "$PWD/payload:/z" \
