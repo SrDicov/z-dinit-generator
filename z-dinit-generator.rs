@@ -581,7 +581,7 @@ fn zinit_socket(flag: Option<&str>) -> String {
     if let Some(p) = flag {
         return p.to_string();
     }
-    std::env::var("ZINIT_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
+    std::env::var(SOCKET_ENV).unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
 }
 
 fn c4_transact(sock: &str, frame: &str) -> Result<String, String> {
