@@ -142,7 +142,13 @@ mod tests {
     use std::io::{Read, Write};
 
     fn pair() -> (UnixStream, UnixStream) {
-        let dir = std::env::temp_dir().join(format!("compatd-test-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "compatd-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("ctl");
         let _ = std::fs::remove_file(&path);
