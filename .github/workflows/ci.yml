@@ -20,7 +20,12 @@ jobs:
           printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
           printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
           printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
-          ./dinit-import.sh in out
+          printf 'type = process\ncommand = /bin/sleep 300\nstop-command = /bin/echo bye\n' > in/graceful
+          printf 'type = process\ncommand = /bin/true\nrestart = false\nchain-to = done2\n' > in/chainer
+          printf 'type = scripted\ncommand = /bin/true\nstop-command = /bin/echo x\nchain-to = done2\n' > in/ochain
+          ./dinit-import.sh in out 2>warn.txt || exit 1
+          grep -q 'chain-to needs a shell' warn.txt
+          grep -q 'stop-command needs a shell' warn.txt
           grep -q '^type = process$' out/sshd.conf
           grep -q '^depends = net, log$' out/sshd.conf
           grep -q '^restart = always$' out/sshd.conf
@@ -39,11 +44,17 @@ jobs:
           grep -q '^command = exec 5>&\$ZINIT_NOTIFY_FD; exec /bin/daemon$' out/notifier.conf
           grep -q '^restart = always$' out/notifier.conf
           grep -q '^restart-budget = 3 restarts per 10s$' out/notifier.conf
+          grep -q '^type = script$' out/graceful.conf
+          grep -qF "trap '/bin/echo bye' TERM; /bin/sleep 300" out/graceful.conf
+          grep -q '^type = script$' out/chainer.conf
+          grep -qF 'zctl start done2' out/chainer.conf
+          grep -q '^type = oneshot$' out/ochain.conf
+          grep -q '^command = /bin/true$' out/ochain.conf
           ! grep -q '^restart' out/boot.conf
       - name: c1
         run: |
-          gh release download v0.0.1 -R SrDicov/zinit --pattern '*x86_64*'
-          tar xzf zinit-v0.0.1-x86_64-unknown-linux-musl.tar.gz
-          zinit-v0.0.1-x86_64-unknown-linux-musl/zinit check out
+          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*'
+          tar xzf zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
+          zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check out
         env:
           GH_TOKEN: ${{ github.token }}

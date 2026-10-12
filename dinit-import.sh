@@ -8,7 +8,10 @@
 # restart ausente/true en proceso=>always+`3 restarts per 10s`
 # (envolvente dinit: el always solo de zinit es infinito);
 # on-failure=>igual salvo oneshot=>never; sin logfile=>none;
-# *-d depends=>required, *-d waits/ms=>opt:; resto se avisa y se omite.
+# stop-command=>trap TERM (solo proceso; oneshot/forking avisado);
+# chain-to=>zctl start sin espera (solo proceso; B intacto para que un
+# rescate nunca bloquee el arranque); *-d depends=>required, *-d
+# waits/ms=>opt:; resto se avisa y se omite.
 # Salida: 0 (saltos son avisos), 1 fallo E/S, 2 uso. POSIX sh.
 set -eu
 p=dinit-import
@@ -25,6 +28,7 @@ dur() { case "$1" in *[!0-9]*) printf '%s' "$1";; *) printf '%ss' "$1";; esac; }
 convert() {
     f=$1 n=$2
     type= command= deps= restart= budget= stop= start= user= wdir= log= pid= ready= notifyfd=
+    stopcmd= chain= chainalways=
     tmp=${TMPDIR:-/tmp}/$p.$$
     sed -e 's/#.*$//' -e '/^ *$/d' "$f" >"$tmp" || return 1
     while IFS= read -r ln; do
@@ -51,6 +55,10 @@ convert() {
                 *) warn "$n: ready $v ignored";; esac;;
             restart) case "$v" in true|yes|1) restart=always;; false|no|0) restart=never;; on-failure) restart=on-failure;; *) warn "$n: restart=$v ignored";; esac;;
             restart-delay|restart-limit-*) warn "$n: $k ignored; 3-per-10s envelope used";;
+            stop-command) if [ "$ap" = 1 ]; then stopcmd="$stopcmd $v"; else stopcmd=$v; fi;;
+            chain-to) chain=$v;;
+            options) case "$v" in *always-chain*) chainalways=1;; esac
+                warn "$n: options ignored except always-chain";;
             stop-timeout) stop=$(dur "$v");;
             start-timeout) start=$(dur "$v");;
             run-as) user=$v;;
@@ -69,19 +77,44 @@ convert() {
         *) warn "$n: type '$type' unknown, skipped"; return 0;;
     esac
     if [ -z "$command" ]; then warn "$n: no command, skipped"; return 0; fi
+    # Shell assembly: cd, fd-dup, TERM-trap and chain-tail compose as one
+    # prelude. dinit runs stop-command INSTEAD of signalling; the trap
+    # reproduces that (group TERM kills the child too, cleanup runs
+    # post-death like the early clock/rng scripts want). chain-to fires
+    # `zctl start` on clean exit with no wait (a rescue chain must never
+    # gate boot, so B is left untouched at load). Plain services keep
+    # direct exec (no shell tax, pid = service); composed ones become
+    # script, whose whole line reaches /bin/sh -c unsplit. oneshot and
+    # forking stay direct no matter what: oneshot would shred a prelude
+    # in the naive word split (proven: exit-2 loop), and a shell around
+    # forking would never exit to adopt. Dropped features are warned.
+    pre=""
+    [ -n "$wdir" ] && pre="cd $(squote "$wdir") && "
     if [ -n "$notifyfd" ]; then
-        if [ "$zt" = oneshot ]; then warn "$n: pipefd needs a process, ignored"; else
+        if [ "$zt" = oneshot ] || [ "$zt" = forking ]; then warn "$n: pipefd needs a plain process, ignored"; notifyfd=;
+        else pre="${pre}exec $notifyfd>&\$ZINIT_NOTIFY_FD; "; fi
+    fi
+    stunt=""
+    [ -n "$stopcmd" ] && stunt="trap $(squote "$stopcmd") TERM; "
+    tail=""
+    if [ -n "$chain" ]; then
+        case "$chain" in *[!a-zA-Z0-9_.@+-]*|""|.*|@*|*@|*..*|*@*@*) warn "$n: chain-to $chain ignored"; chain=;; esac
+    fi
+    if [ -n "$chain" ]; then
+        if [ -n "$chainalways" ]; then tail="; code=\$?; command -v zctl >/dev/null 2>&1 && zctl start $chain; exit \$code";
+        else tail="; code=\$?; if [ \$code -eq 0 ]; then command -v zctl >/dev/null 2>&1 && zctl start $chain; fi; exit \$code"; fi
+    fi
+    if [ -n "$pre$stunt$tail" ]; then
+        if [ "$zt" = forking ] || [ "$zt" = oneshot ]; then
+            [ -z "$wdir" ] || warn "$n: working-dir needs a shell, ignored"
+            [ -z "$stopcmd" ] || warn "$n: stop-command needs a shell, ignored"
+            [ -z "$chain" ] || warn "$n: chain-to needs a shell, ignored"
+        else
             zt=script
-            command="exec $notifyfd>&\$ZINIT_NOTIFY_FD; exec $command"
+            if [ -n "$stunt$tail" ]; then command="$stunt$pre$command$tail";
+            else command="${pre}exec $command"; fi
         fi
     fi
-    # s6-style pipefd:N: the service writes readiness to fd N, but zinit
-    # listens on $ZINIT_NOTIFY_FD, so a shell prelude dups it over. Any
-    # non-blank byte readies (legacy rule); a bare newline does not, it
-    # falls back to the ready timeout. N > 9 needs multi-digit fd
-    # redirection in /bin/sh (Chimera stock sh stops at 9).
-    # Wrapping precedes the cd: `exec cd` would replace the shell instead.
-    if [ -n "$wdir" ]; then command="cd $(squote "$wdir") && $command"; fi
     case "$zt" in
         oneshot) [ "$restart" = on-failure ] && restart=never;;
     esac
