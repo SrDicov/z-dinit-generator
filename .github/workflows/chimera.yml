@@ -40,7 +40,16 @@ jobs:
           rm -rf payload && mkdir payload
           cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
           cp /tmp/zdg payload/dinitctl
+          cp /tmp/zdg payload/z-dinit-generator
           cp -r out payload/out
+          printf 'type = process\ncommand = /z/z-dinit-generator compatd\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n' > payload/out/compatd.conf
+          if [ -f payload/out/early-devmon.conf ]; then
+            if grep -q '^depends = ' payload/out/early-devmon.conf; then
+              sed -i 's/^depends = /depends = compatd, /' payload/out/early-devmon.conf
+            else
+              printf 'depends = compatd\n' >> payload/out/early-devmon.conf
+            fi
+          fi
           docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
             -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
             -v "$PWD/payload:/z" \
@@ -53,7 +62,12 @@ jobs:
           sleep 10
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
-          for s in sshd dbus-daemon chronyd crond udevd uuidd boot system early-env early-devmon device local.target early-cryptdisks; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          for s in sshd dbus-daemon chronyd crond udevd uuidd boot system early-env early-devmon device local.target early-cryptdisks compatd; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          docker exec zb sh -c 'test -S /run/dinitctl && echo compatd-sock-ok' | tee compatd-sock.txt
+          grep -q 'compatd-sock-ok' compatd-sock.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status compatd | grep -q ' running '
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status early-devmon | tee devmon.txt
+          grep -q ' running ' devmon.txt
           docker exec zb sh -c "printf 'type = script\ncommand = echo ok > /z/probe.done\nready = none\nrestart = never\nlog = none\n' > /z/out/probe.conf"
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl reload-all
           sleep 5
@@ -74,6 +88,8 @@ jobs:
             warn.log
             states.txt
             status.txt
+            compatd-sock.txt
+            devmon.txt
             probe.txt
             zb.log
             corpus-scripts
