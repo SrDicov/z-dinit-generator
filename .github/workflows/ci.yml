@@ -32,6 +32,34 @@ jobs:
           ./dinit-import.sh in out-sh 2>/dev/null
           /tmp/zdg convert in out-rs 2>/dev/null
           diff -r out-sh out-rs && echo "parity: byte-identical"
+      - name: start live path on fake system dirs
+        run: |
+          sudo mkdir -p /usr/lib/dinit.d /etc/dinit.d
+          printf 'type = process\ncommand = /bin/sleep 300\n' | sudo tee /usr/lib/dinit.d/base >/dev/null
+          printf 'type = process\ncommand = /bin/sleep 300\ndepends-on = base\n' | sudo tee /etc/dinit.d/top >/dev/null
+          printf 'type = internal\ndepends-on = top\n' | sudo tee /etc/dinit.d/boot >/dev/null
+          sudo rm -rf /tmp/prove-out
+          /tmp/zdg start --out /tmp/prove-out
+          test -f /tmp/prove-out/top.conf
+          test -f /tmp/prove-out/compatd.conf
+          test -f /tmp/prove-out/dinit-watch.conf
+          grep -q '^depends = base$' /tmp/prove-out/top.conf
+          grep -q 'compatd' /tmp/prove-out/compatd.conf
+          sudo rm -f /usr/lib/dinit.d/base /etc/dinit.d/top /etc/dinit.d/boot
+          echo "start: live path ok"
+      - name: watch retranslates without manual convert
+        run: |
+          rm -rf win wout && mkdir win wout
+          printf 'type = process\ncommand = /bin/sleep 300\n' > win/a
+          ZINIT_SOCKET=/tmp/zdg-no-such-sock /tmp/zdg watch win wout 2>watch.log &
+          WPID=$!
+          sleep 3
+          test -f wout/a.conf
+          printf 'type = process\ncommand = /bin/sleep 300\n' > win/b
+          sleep 5
+          test -f wout/b.conf || { echo "watch did not pick up b"; kill $WPID; exit 1; }
+          kill $WPID
+          echo "watch: mode 2 ok"
   import:
     runs-on: ubuntu-latest
     steps:
