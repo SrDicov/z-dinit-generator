@@ -147,7 +147,7 @@ mod tests {
         let path = dir.join("ctl");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let mut client = UnixStream::connect(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
         let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
         (server, client)
