@@ -11,6 +11,27 @@ jobs:
           rustc --test -D warnings --edition=2021 compatd.rs -o /tmp/compatd-test
           /tmp/compatd-test
           rustc -O -D warnings --edition=2021 compatd.rs -o /tmp/compatd
+          rustc --test -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg-test
+          /tmp/zdg-test
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+      - name: parity sh vs rust
+        run: |
+          rm -rf in out-sh out-rs && mkdir in out-sh out-rs
+          printf 'type = process\ncommand = /usr/sbin/sshd -D\ndepends-on = net\ndepends-ms = log\nrestart = true\nstop-timeout = 5\n' > in/sshd
+          printf 'type = scripted\ncommand = /s/fs.sh\nrestart = false\n' > in/fs
+          printf 'type = internal\ndepends-on = sshd\n' > in/boot
+          printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
+          printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
+          printf 'type = process\ncommand = /bin/sleep 300\nstop-command = /bin/echo bye\n' > in/graceful
+          printf 'type = process\ncommand = /bin/true\nrestart = false\nchain-to = done2\n' > in/chainer
+          printf 'type = scripted\ncommand = /bin/true\nstop-command = /bin/echo x\nchain-to = done2\n' > in/ochain
+          printf 'type = internal\n' > in/boot2
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/lonely
+          ./dinit-import.sh in out-sh 2>/dev/null
+          /tmp/zdg convert in out-rs 2>/dev/null
+          diff -r out-sh out-rs && echo "parity: byte-identical"
   import:
     runs-on: ubuntu-latest
     steps:
