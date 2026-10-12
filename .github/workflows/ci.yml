@@ -1,6 +1,16 @@
 name: ci
 on: [push, pull_request]
 jobs:
+  compatd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build and test (std only, no cargo)
+        run: |
+          rustc --test -D warnings --edition=2021 compatd.rs -o /tmp/compatd-test
+          /tmp/compatd-test
+          rustc -O -D warnings --edition=2021 compatd.rs -o /tmp/compatd
   import:
     runs-on: ubuntu-latest
     steps:
