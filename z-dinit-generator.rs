@@ -345,7 +345,7 @@ fn dinit_secs(v: &str) -> Option<String> {
             if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
-            let mut ms: u64 = int.parse().unwrap_or(0).saturating_mul(1000);
+            let mut ms: u64 = int.parse().unwrap_or(0u64).saturating_mul(1000);
             let mut scale = 100u64;
             for c in f.chars().take(3) {
                 ms = ms.saturating_add((c as u64 - '0' as u64) * scale);
