@@ -84,8 +84,8 @@ const ST_STARTED: u8 = 2;
 // dinit dependency types: REGULAR 0, WAITS_FOR 2, MILESTONE 3 (the only three
 // ADD_DEP accepts; BEFORE 4 / AFTER 5 never cross the wire).
 
-fn warn(msg: &str) {
-    eprintln!("z-dinit-generator: {msg}");
+fn warn(msg: impl AsRef<str>) {
+    eprintln!("z-dinit-generator: {}", msg.as_ref());
 }
 
 fn usage() -> i32 {
