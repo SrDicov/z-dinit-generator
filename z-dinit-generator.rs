@@ -3464,6 +3464,9 @@ mod tests {
 
     #[test]
     fn dctl_start_family_and_refusals() {
+        // NOTE: never run these tests as root: the shutdown verb below
+        // drives the real /proc/sysrq-trigger path (CI is unprivileged,
+        // so it stops at EPERM and reports failure as designed).
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         // wake/trigger collapse onto start; release onto stop.
@@ -3477,9 +3480,6 @@ mod tests {
         assert_eq!(dctl(&zsock, &["stop", "--no-wait", "nosuch"]), 1);
         assert_eq!(dctl(&zsock, &["signal", "--list"]), 0);
         // loud refusals.
-        assert_eq!(dctl(&zsock, &["unload", "a"]), 1);
-        assert_eq!(dctl(&zsock, &["shutdown"]), 1);
-        assert_eq!(dctl(&zsock, &["untrigger", "a"]), 1);
         assert_eq!(dctl(&zsock, &["frobnicate"]), 1);
         assert_eq!(dctl(&zsock, &[]), 1);
         assert_eq!(dctl(&zsock, &["--bogus", "list"]), 1);
@@ -3488,6 +3488,11 @@ mod tests {
         assert_eq!(dctl(&zsock, &["is-started", "a"]), 0);
         assert_eq!(dctl(&zsock, &["is-started", "b"]), 1);
         assert_eq!(dctl(&zsock, &["is-failed", "b"]), 1);
+        // loud refusals last: shutdown stops the stub services as a side
+        // effect, so nothing stateful may follow it in this test.
+        assert_eq!(dctl(&zsock, &["unload", "a"]), 1);
+        assert_eq!(dctl(&zsock, &["shutdown"]), 1);
+        assert_eq!(dctl(&zsock, &["untrigger", "a"]), 1);
     }
 
     #[test]
@@ -3710,10 +3715,14 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_naks_valid_types_badreqs_junk() {
+    fn shutdown_types_map_to_graceful_or_nak() {
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        // With no supervisor the list is empty: graceful trivially holds,
+        // and the sysrq file lands in /tmp (never the real trigger here).
         client.write_all(&[SHUTDOWN, 4]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        client.write_all(&[SHUTDOWN, 5]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
         client.write_all(&[SHUTDOWN, 9]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [BADREQ]);
