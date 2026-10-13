@@ -14,6 +14,12 @@ jobs:
           rustc --test -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg-test
           /tmp/zdg-test
           rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: z-dinit-generator-linux-x86_64
+          path: /tmp/zdg
+          if-no-files-found: error
+          retention-days: 14
       - name: parity sh vs rust
         run: |
           rm -rf in out-sh out-rs && mkdir in out-sh out-rs
