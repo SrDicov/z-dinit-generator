@@ -62,6 +62,10 @@ def stub_server():
                     base = name.split("@")[0] if "@" in name else name
                     if base not in ("a", "b"):
                         rep = "E compatd 3 unknown service\n"
+                    elif "@" in name and not reloaded:
+                        # instances exist only once the supervisor has
+                        # reloaded after synthesis.
+                        rep = "E compatd 3 unknown service\n"
                     elif name in stopped or base in stopped:
                         rep = "R compatd 0 x stopped desired=down pid=- up=- restarts=0/3\n"
                     else:
@@ -74,9 +78,11 @@ def stub_server():
                     if w[3] not in ("a", "b"):
                         rep = "E compatd 3 unknown service\n"
                     else:
-                        # lag simulation: `stop a` is accepted but never
-                        # lands (exercises the ACK path); all else applies.
-                        if not (w[2] == "stop" and w[3] == "a"):
+                        # lag simulation while unreloaded: `stop a` is
+                        # accepted but never lands (exercises the ACK path).
+                        # After the first reload-all everything applies, so
+                        # the later SHUTDOWN check can stop the world.
+                        if not (w[2] == "stop" and w[3] == "a" and not reloaded):
                             if w[2] == "stop":
                                 stopped.add(w[3])
                             else:
@@ -246,7 +252,11 @@ try:
     check("catlog", cl[0] == 73 and c2.read(cl[2]) == b"logged", repr(cl))
     c2.raw(bytes([20, 0]) + struct.pack("<I", fb))
     check("catlog-none", c2.read(1) == bytes([51]))
-    # 17. signal paths
+    # 17. signal paths (park b stopped first: prior sections move it).
+    c2.raw(bytes([4, 0]) + struct.pack("<I", fb))
+    c2.read(17)
+    c2.read(21)
+    assert c2.read(1) == bytes([61])
     c2.raw(bytes([21]) + struct.pack("<iI", 15, fb))
     check("signal-nopid", c2.read(1) == bytes([74]))
     c2.raw(bytes([21]) + struct.pack("<iI", 0, fa))
