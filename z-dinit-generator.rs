@@ -442,6 +442,8 @@ fn convert_one(
     let mut ready = String::new();
     let mut notifyfd = String::new();
     let mut stopcmd = String::new();
+    let mut command_raw = String::new();
+    let mut stopcmd_raw = String::new();
     let mut chain = String::new();
     let mut chainalways = false;
     let mut notifyvar = String::new();
@@ -471,11 +473,18 @@ fn convert_one(
             "type" => stype = v,
             "command" => {
                 let vv = sub_arg1(&v, n, warns);
+                // Raw twin (quotes intact): zinit splits process commands
+                // on whitespace with no quoting, so a quoted command can
+                // only survive as `script`, where the shell re-parses it.
+                let vr = sub_arg1(trim_spaces(v_raw), n, warns);
                 if ap {
                     command.push(' ');
                     command.push_str(&vv);
+                    command_raw.push(' ');
+                    command_raw.push_str(&vr);
                 } else {
                     command = vv;
+                    command_raw = vr;
                 }
             }
             "depends-on" | "depends-ms" => {
@@ -574,12 +583,15 @@ fn convert_one(
                 }
             }
             "stop-command" => {
-                let vv = sub_arg1(&v, n, warns);
+                let vr = sub_arg1(trim_spaces(v_raw), n, warns);
                 if ap {
                     stopcmd.push(' ');
-                    stopcmd.push_str(&vv);
+                    stopcmd.push_str(&vr);
+                    stopcmd_raw.push(' ');
+                    stopcmd_raw.push_str(&vr);
                 } else {
-                    stopcmd = vv;
+                    stopcmd = vr.clone();
+                    stopcmd_raw = vr;
                 }
             }
             "chain-to" => chain = v,
@@ -746,8 +758,8 @@ fn convert_one(
         }
     }
     let mut stunt = String::new();
-    if !stopcmd.is_empty() {
-        stunt = format!("trap {} TERM; ", squote(&stopcmd));
+    if !stopcmd_raw.is_empty() {
+        stunt = format!("trap {} TERM; ", squote(&stopcmd_raw));
     }
     let mut tail = String::new();
     if !chain.is_empty() {
@@ -767,8 +779,26 @@ fn convert_one(
             );
         }
     }
+    let quoted = command_raw.contains('"') || command_raw.contains('\'');
+    if quoted {
+        if zt == "process" {
+            command = command_raw.clone();
+        } else {
+            w!("quoted command needs a shell; oneshot/forking kept direct and may split it wrongly");
+        }
+    }
     let mut zt_owned = zt.to_string();
-    if !pre.is_empty() || !stunt.is_empty() || !tail.is_empty() {
+    if quoted && zt == "process" {
+        // Raw shell text, quotes intact: the shell groups exactly like
+        // dinit's own tokenizer did (verified: zero quoted commands in
+        // the 63-service Chimera corpus, so this path is the exception).
+        zt_owned = "script".to_string();
+        if !stunt.is_empty() || !tail.is_empty() {
+            command = format!("{stunt}{pre}{command}{tail}");
+        } else {
+            command = format!("{pre}exec {command}");
+        }
+    } else if !pre.is_empty() || !stunt.is_empty() || !tail.is_empty() {
         if zt == "forking" || zt == "oneshot" {
             if !wdir.is_empty() {
                 w!("working-dir needs a shell, ignored".to_string());
@@ -3323,6 +3353,53 @@ mod tests {
         assert!(w.contains("option bogus-opt ignored"), "got: {w}");
         assert!(w.contains("rlimit-core ignored"), "got: {w}");
         assert!(w.contains("env-file line ignored: BADLINE"), "got: {w}");
+    }
+
+    #[test]
+    fn quoted_command_becomes_script_with_raw_text() {
+        let dir = tmpout("quote-in");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /bin/sh -c 'mkdir -p /run/x && exec /usr/sbin/svc -E /x.log'\n",
+            "s",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("type = script\n"), "got:\n{}", c.text);
+        assert!(
+            c.text.contains("exec /bin/sh -c 'mkdir -p /run/x && exec /usr/sbin/svc -E /x.log'\n"),
+            "got:\n{}",
+            c.text
+        );
+        // plain commands are untouched (parity path).
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /bin/sleep 300\n",
+            "t",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("type = process\n"), "got:\n{}", c.text);
+        // quoted oneshot warns loudly (no shell available there).
+        let mut warns = Vec::new();
+        let _ = convert_one(
+            "type = scripted\ncommand = /bin/echo 'a  b'\n",
+            "o",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(warns.join("\n").contains("quoted command needs a shell"), "got: {warns:?}");
     }
 
     #[test]
