@@ -213,6 +213,9 @@ try:
     check("setenv", c2.read(1) == bytes([50]))
     c2.raw(bytes([17]) + struct.pack("<H", 2) + b"=x")
     check("setenv-bad", c2.read(1) == bytes([52]))
+    check("setenv-bad-eof", c2.read(1) == b"")
+    # BADREQ closes the connection upstream too: fresh socket, same handles.
+    c2 = C()
     # 15. allenv empty
     c2.raw(bytes([24, 0]))
     ae = c2.read(9)
