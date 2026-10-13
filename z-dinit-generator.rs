@@ -3295,17 +3295,20 @@ mod tests {
         let od = out.display().to_string();
         // need with a running and b stopped contradicts the states -> refused.
         assert_eq!(dctl(&zsock, &["add-dep", "need", "a", "b", "--out", &od]), 1);
-        // waits-for persists.
+        // milestone is hard and acyclic here -> persists.
+        assert_eq!(dctl(&zsock, &["add-dep", "milestone", "b", "a", "--out", &od]), 0);
+        let text = std::fs::read_to_string(out.join("b.conf")).unwrap();
+        assert!(text.contains("depends = a\n"), "got: {text}");
+        // closing the loop the other way is a cycle -> refused.
+        assert_eq!(dctl(&zsock, &["add-dep", "waits-for", "a", "b", "--out", &od]), 1);
+        // junk type is a usage error.
+        assert_eq!(dctl(&zsock, &["add-dep", "before", "a", "b", "--out", &od]), 1);
+        // open the loop again, then waits-for persists.
+        assert_eq!(dctl(&zsock, &["rm-dep", "milestone", "b", "a", "--out", &od]), 0);
         assert_eq!(dctl(&zsock, &["add-dep", "waits-for", "a", "b", "--out", &od]), 0);
         let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
         assert!(text.contains("depends = opt:b\n"), "got: {text}");
         assert!(reloaded.load(Ordering::SeqCst));
-        // milestone is hard.
-        assert_eq!(dctl(&zsock, &["add-dep", "milestone", "b", "a", "--out", &od]), 0);
-        let text = std::fs::read_to_string(out.join("b.conf")).unwrap();
-        assert!(text.contains("depends = a\n"), "got: {text}");
-        // junk type is a usage error.
-        assert_eq!(dctl(&zsock, &["add-dep", "before", "a", "b", "--out", &od]), 1);
         // removal works once, then refuses.
         assert_eq!(dctl(&zsock, &["rm-dep", "waits-for", "a", "b", "--out", &od]), 0);
         assert_eq!(dctl(&zsock, &["rm-dep", "waits-for", "a", "b", "--out", &od]), 1);
