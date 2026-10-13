@@ -90,9 +90,9 @@ fn warn(msg: impl AsRef<str>) {
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: z-dinit-generator <convert|watch|dinitctl|compatd|start> [...]\n\
+        "usage: z-dinit-generator <convert|watch|dinitctl|compatd|start|poweroff|reboot|halt> [...]\n\
          convert <dinitdir> <outdir> | watch <dinitdir>... <outdir> |\n\
-         dinitctl <cmd> [args] | compatd [/run/dinitctl] [--out DIR] | start [--out DIR]"
+         dinitctl <cmd> [args] | compatd [/run/dinitctl] [--out DIR] | start [--out DIR] | poweroff | reboot | halt"
     );
     2
 }
@@ -1603,8 +1603,13 @@ fn cmd_dinitctl_sock(args: &[String], sock_override: Option<&str>) -> i32 {
             if !rest.is_empty() {
                 return dctl_usage();
             }
-            warn("shutdown: zinit has no poweroff/reboot path by design".to_string());
-            1
+            // dinitctl shutdown stops everything and powers off.
+            if graceful_shutdown(&sock, "/proc/sysrq-trigger", Some(b'o')) {
+                0
+            } else {
+                warn("shutdown failed".to_string());
+                1
+            }
         }
         "untrigger" => {
             if rest.len() != 1 {
@@ -2016,6 +2021,7 @@ fn valid_proto_name(n: &[u8]) -> bool {
 struct Ctx {
     outdir: std::path::PathBuf,
     zsock: String,
+    sysrq: String,
 }
 
 fn read_depends(outdir: &std::path::Path, from: &str) -> Option<Vec<String>> {
@@ -2318,15 +2324,29 @@ fn serve_one(
                 }
             }
             SHUTDOWN => {
-                // zinit has no poweroff/reboot path by design: refuse loudly.
+                // Shutdown types: REMAIN 1, HALT 2, POWEROFF 3, REBOOT 4,
+                // SOFTREBOOT 5, KEXEC 6. Anything else is BADREQ upstream.
                 let mut b = [0u8; 1];
                 if !rd_n(s, &mut b) {
                     return next_handle;
                 }
-                if !(1..=6).contains(&b[0]) {
-                    badreq!();
-                }
-                if !wr_all(s, &[NAK]) {
+                let letter = match b[0] {
+                    1 => None,
+                    2 | 3 => Some(b'o'),
+                    4 => Some(b'b'),
+                    5 | 6 => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                    _ => badreq!(),
+                };
+                if graceful_shutdown(&ctx.zsock, &ctx.sysrq, letter) {
+                    if !wr_all(s, &[ACK]) {
+                        return next_handle;
+                    }
+                } else if !wr_all(s, &[NAK]) {
                     return next_handle;
                 }
             }
@@ -2745,6 +2765,33 @@ fn serve_one(
     }
 }
 
+/// Graceful shutdown: stop every non-stopped service (dinit stop_all
+/// order), then, unless `letter` is None (REMAIN: stay up, no services),
+/// sync and hand the machine to the kernel via sysrq (`o` poweroff,
+/// `b` reboot). HALT maps to `o`: sysrq cannot halt without cutting
+/// power (documented divergence). There is no graceful path for
+/// SOFTREBOOT/KEXEC: the caller must NAK those.
+fn graceful_shutdown(zsock: &str, sysrq_path: &str, letter: Option<u8>) -> bool {
+    let list = z_list(zsock).unwrap_or_default();
+    let mut ok = true;
+    for (name, state) in &list {
+        if z_state_tok(state) == ST_STOPPED {
+            continue;
+        }
+        if !z_act(zsock, "stop", name) || !wait_state(zsock, name, false, 300) {
+            ok = false;
+        }
+    }
+    match letter {
+        None => ok,
+        Some(l) => {
+            // Best effort: a failed sync must not cancel the power path.
+            let _ = std::process::Command::new("sync").status();
+            ok && std::fs::write(sysrq_path, [l]).is_ok()
+        }
+    }
+}
+
 fn cmd_compatd(path: &str, outdir: &std::path::Path) -> i32 {
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
@@ -2757,6 +2804,7 @@ fn cmd_compatd(path: &str, outdir: &std::path::Path) -> i32 {
     let ctx = Ctx {
         outdir: outdir.to_path_buf(),
         zsock: zinit_socket(None),
+        sysrq: String::from("/proc/sysrq-trigger"),
     };
     let mut next_handle = 0u32;
     let mut names: BTreeMap<u32, String> = BTreeMap::new();
@@ -2972,6 +3020,28 @@ fn main() -> std::process::ExitCode {
                 2
             }
         }
+        "poweroff" | "halt" => {
+            if !args.is_empty() {
+                eprintln!("usage: z-dinit-generator {verb}");
+                2
+            } else if graceful_shutdown(&zinit_socket(None), "/proc/sysrq-trigger", Some(b'o')) {
+                0
+            } else {
+                eprintln!("z-dinit-generator: {verb} failed");
+                1
+            }
+        }
+        "reboot" => {
+            if !args.is_empty() {
+                eprintln!("usage: z-dinit-generator reboot");
+                2
+            } else if graceful_shutdown(&zinit_socket(None), "/proc/sysrq-trigger", Some(b'b')) {
+                0
+            } else {
+                eprintln!("z-dinit-generator: reboot failed");
+                1
+            }
+        }
         _ => usage(),
     };
     std::process::ExitCode::from(rc as u8)
@@ -3076,6 +3146,7 @@ mod tests {
 
     fn fctx() -> Ctx {
         Ctx {
+            sysrq: String::from("/tmp/zdg-no-such-sysrq"),
             outdir: std::env::temp_dir().join("zdg-no-such-outdir"),
             zsock: String::from("/tmp/zdg-no-such-sock-xyz"),
         }
@@ -3094,11 +3165,16 @@ mod tests {
         })
     }
 
-    /// Stub zinit C4 server: fixed services, records reload-all.
+    /// Stub zinit C4 server: a/b services, stop/start mutate state,
+    /// reload-all is recorded. Each test gets an isolated instance.
     fn stub(
         reloaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> (String, std::thread::JoinHandle<()>) {
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::collections::HashSet;
+        let stopped = std::sync::Arc::new(std::sync::Mutex::new(HashSet::<String>::from([
+            "b".to_string(),
+        ])));
         static N: AtomicU32 = AtomicU32::new(100);
         let dir = std::env::temp_dir().join(format!(
             "zdg-stub-{}-{}",
@@ -3111,6 +3187,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let sock = path.display().to_string();
         let rl = reloaded.clone();
+        let stopped = stopped.clone();
         let h = std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let mut c = match conn {
@@ -3125,10 +3202,17 @@ mod tests {
                         Err(_) => break,
                     }
                     let w: Vec<&str> = line.split_whitespace().collect();
+                    let is_stopped = |n: &str| stopped.lock().unwrap().contains(n);
+                    let status_of = |n: &str| -> &'static str {
+                        if is_stopped(n) {
+                            "R compatd 0 x stopped desired=down pid=- up=- restarts=0/3\n"
+                        } else {
+                            "R compatd 0 x running desired=up pid=99 up=1s restarts=0/3\n"
+                        }
+                    };
                     let reply = if w.len() >= 4 && w[2] == "status" {
                         match w[3] {
-                            "a" => "R compatd 0 a running desired=up pid=99 up=1s restarts=0/3\n",
-                            "b" => "R compatd 0 b stopped desired=down pid=- up=- restarts=0/3\n",
+                            "a" | "b" => status_of(w[3]),
                             w3 if w3.contains('@') => {
                                 // instances exist only once the supervisor
                                 // has reloaded after synthesis.
@@ -3142,11 +3226,22 @@ mod tests {
                             _ => "E compatd 3 unknown service\n",
                         }
                     } else if w.len() >= 3 && w[2] == "list" {
-                        "R compatd 0 2 a=running b=stopped\n"
+                        {
+                            let sa = if is_stopped("a") { "stopped" } else { "running" };
+                            let sb = if is_stopped("b") { "stopped" } else { "running" };
+                            // string built per request; leaked to 'static for the match shape.
+                            Box::leak(format!("R compatd 0 2 a={sa} b={sb}\n").into_boxed_str()) as &'static str
+                        }
                     } else if w.len() >= 4 && (w[2] == "start" || w[2] == "stop" || w[2] == "restart") {
                         if w[3] == "nosuch" {
                             "E compatd 3 unknown service\n"
                         } else {
+                            let mut set = stopped.lock().unwrap();
+                            if w[2] == "stop" {
+                                set.insert(w[3].to_string());
+                            } else {
+                                set.remove(w[3]);
+                            }
                             "R compatd 0\n"
                         }
                     } else if w.len() >= 3 && w[2] == "reload-all" {
@@ -3256,7 +3351,7 @@ mod tests {
         let (zsock, _stub) = stub(reloaded.clone());
         let out = tmpout("inst");
         std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a %i\n").unwrap();
-        let ctx = Ctx { outdir: out.clone(), zsock };
+        let ctx = Ctx { outdir: out.clone(), zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 96);
         let hd = find_handle(&mut client, "", b"a@tty1");
@@ -3430,6 +3525,56 @@ mod tests {
             dctl("/tmp/zdg-no-such-sock-xyz", &["reload", "nosuch", "--offline", "-d", &dd_s, "--out", &od]),
             1
         );
+    }
+
+    #[test]
+    fn graceful_shutdown_remain_stops_without_sysrq() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let sysrq = tmpout("remain").join("sysrq");
+        assert!(graceful_shutdown(&zsock, &sysrq.display().to_string(), None));
+        // a was running: stopped now; the trigger file stays untouched.
+        assert!(z_status(&zsock, "a").map(|st| st.state == ST_STOPPED).unwrap_or(false));
+        assert!(!sysrq.exists());
+    }
+
+    #[test]
+    fn graceful_shutdown_poweroff_writes_the_letter() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let sysrq = tmpout("off").join("sysrq");
+        let path = sysrq.display().to_string();
+        assert!(graceful_shutdown(&zsock, &path, Some(b'o')));
+        assert_eq!(std::fs::read(&sysrq).unwrap(), b"o");
+    }
+
+    #[test]
+    fn compatd_shutdown_remain_acks_and_softreboot_naks() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("shut");
+        let sysrq = tmpout("shut-sys").join("sysrq");
+        let ctx = Ctx {
+            outdir: out,
+            zsock,
+            sysrq: sysrq.display().to_string(),
+        };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 97);
+        let ah = find_handle(&mut client, "", b"a");
+        client.write_all(&[SHUTDOWN, 1]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        // a is stopped now (fresh handle: service re-queried live).
+        let ah2 = find_handle(&mut client, "", b"a");
+        assert_ne!(ah, ah2);
+        client.write_all(&[SERVICESTATUSQ]).unwrap();
+        client.write_all(&ah2.to_le_bytes()).unwrap();
+        let st = read_exact(&mut client, 12);
+        assert_eq!(st[2], ST_STOPPED);
+        client.write_all(&[SHUTDOWN, 5]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
     }
 
     #[test]
@@ -3618,7 +3763,7 @@ mod tests {
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("find");
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 10);
         let hd = find_handle(&mut client, "", b"a");
@@ -3637,7 +3782,7 @@ mod tests {
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("start");
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 20);
         let hd = find_handle(&mut client, "", b"a");
@@ -3664,7 +3809,7 @@ mod tests {
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("stop");
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 30);
         let hd = find_handle(&mut client, "", b"b");
@@ -3684,7 +3829,7 @@ mod tests {
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("status");
         std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 40);
         let hd = find_handle(&mut client, "", b"a");
@@ -3709,7 +3854,7 @@ mod tests {
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("list");
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 50);
         client.write_all(&[LISTSERVICES5]).unwrap();
@@ -3729,7 +3874,7 @@ mod tests {
         let out = tmpout("dep");
         std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
         std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\n").unwrap();
-        let ctx = Ctx { outdir: out.clone(), zsock };
+        let ctx = Ctx { outdir: out.clone(), zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 60);
         // stub services a (running) and b (stopped); REGULAR add with
@@ -3777,7 +3922,7 @@ mod tests {
         let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (zsock, _stub) = stub(reloaded);
         let out = tmpout("sig");
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 80);
         let bh = find_handle(&mut client, "", b"b");
@@ -3817,7 +3962,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\nlog = none\n").unwrap();
-        let ctx = Ctx { outdir: out, zsock };
+        let ctx = Ctx { outdir: out, zsock, sysrq: String::from("/tmp/zdg-no-such-sysrq") };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 90);
         let ah = find_handle(&mut client, "", b"a");
@@ -3842,7 +3987,8 @@ mod tests {
         let ctx = Ctx {
             outdir: out.clone(),
             zsock,
-        };
+            sysrq: String::from("/tmp/zdg-no-such-sysrq"),
+        };;
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 95);
         let ah = find_handle(&mut client, "", b"a");
