@@ -139,7 +139,7 @@ jobs:
           echo CONVERT_OK
           cat kout/svc.conf
           grep -q '^type = console$' kout/svc.conf
-          grep -q 'command = /bin/srv %i' kout/svc.conf
+          grep -qF 'exec /bin/srv %i' kout/svc.conf
           grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf
           grep -q '^restart-delay = 500ms$' kout/svc.conf
           grep -q '^tty = /dev/console$' kout/svc.conf
