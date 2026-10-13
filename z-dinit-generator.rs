@@ -158,6 +158,251 @@ fn split_line(ln: &str) -> Option<(&str, &str, bool)> {
     None
 }
 
+/// dinit value cooking (dinit-service(5)): `"..."` keeps its content
+/// literally, `\\x` escapes, unquoted whitespace runs collapse to one space.
+fn cook_value(raw: &str) -> String {
+    let mut o = String::new();
+    let mut it = raw.chars().peekable();
+    let mut space = true;
+    let mut in_q = false;
+    while let Some(c) = it.next() {
+        if in_q {
+            if c == '"' {
+                in_q = false;
+            } else if c == '\\' {
+                if let Some(e) = it.next() {
+                    o.push(e);
+                    space = false;
+                }
+            } else {
+                o.push(c);
+                space = false;
+            }
+        } else if c == '"' {
+            in_q = true;
+        } else if c == '\\' {
+            if let Some(e) = it.next() {
+                o.push(e);
+                space = false;
+            }
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            if !space {
+                o.push(' ');
+                space = true;
+            }
+        } else {
+            o.push(c);
+            space = false;
+        }
+    }
+    if o.ends_with(' ') {
+        o.pop();
+    }
+    o
+}
+
+/// A `#` starts a comment at line start or after whitespace (quotes honored).
+fn strip_comment(ln: &str) -> &str {
+    let b = ln.as_bytes();
+    let mut in_q = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_q {
+            if c == b'"' {
+                in_q = false;
+            } else if c == b'\\' {
+                i += 1;
+            }
+        } else if c == b'"' {
+            in_q = true;
+        } else if c == b'#' && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') {
+            return &ln[..i];
+        }
+        i += 1;
+    }
+    ln
+}
+
+/// Join `\\`-continued lines with one space (odd run = continuation).
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for raw in text.lines() {
+        let ln = raw.strip_suffix('\r').unwrap_or(raw);
+        let t = ln.trim_end();
+        let bs = t.len() - t.trim_end_matches('\\').len();
+        if bs % 2 == 1 {
+            cur.push_str(&t[..t.len() - 1]);
+            cur.push(' ');
+        } else {
+            cur.push_str(ln);
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Inline `@include`/`@include-opt` (8 deep), report the rest.
+fn gather_lines(
+    text: &str,
+    in_dir: &std::path::Path,
+    depth: u8,
+    n: &str,
+    warns: &mut Vec<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for ln in logical_lines(text) {
+        let t = trim_spaces(&ln);
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with('@') {
+            let mut it = t[1..].splitn(2, char::is_whitespace);
+            let cmd = it.next().unwrap_or("");
+            let arg = it.next().map(trim_spaces).unwrap_or("");
+            match cmd {
+                "include" | "include-opt" => {
+                    if depth >= 8 {
+                        warns.push(format!("{n}: @include too deep, ignored"));
+                        continue;
+                    }
+                    let q = std::path::Path::new(arg);
+                    let q = if q.is_absolute() { q.to_path_buf() } else { in_dir.join(arg) };
+                    match std::fs::read_to_string(&q) {
+                        Ok(t2) => out.extend(gather_lines(&t2, in_dir, depth + 1, n, warns)),
+                        Err(_) => {
+                            if cmd == "include" {
+                                warns.push(format!("{n}: @include {arg} missing"));
+                            }
+                        }
+                    }
+                }
+                "meta" => warns.push(format!("{n}: @meta ignored")),
+                _ => warns.push(format!("{n}: @{cmd} ignored")),
+            }
+            continue;
+        }
+        let nc = strip_comment(&ln);
+        if is_blank_spaces(nc) {
+            continue;
+        }
+        out.push(nc.to_string());
+    }
+    out
+}
+
+/// dinit `$1` is the instance argument; zinit spells it `%i`.
+fn sub_arg1(v: &str, n: &str, warns: &mut Vec<String>) -> String {
+    let tmp = v.replace("$$", "\u{0}");
+    let mut o = String::new();
+    let mut i = 0;
+    while i < tmp.len() {
+        let rest = &tmp[i..];
+        if rest.starts_with("$1") {
+            o.push_str("%i");
+            i += 2;
+        } else if rest.starts_with("${") {
+            match rest.find('}') {
+                Some(e) => {
+                    let inner = &rest[2..e];
+                    if inner == "1" {
+                        o.push_str("%i");
+                    } else if inner.starts_with('1') {
+                        warns.push(format!("{n}: ${{{inner}}} truncated to %i"));
+                        o.push_str("%i");
+                    } else {
+                        o.push_str(&rest[..e + 1]);
+                    }
+                    i += e + 1;
+                }
+                None => {
+                    o.push('$');
+                    i += 1;
+                }
+            }
+        } else {
+            let ch = rest.chars().next().unwrap();
+            o.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    o.replace("\u{0}", "$$")
+}
+
+/// dinit seconds (`XXX.YYY`) into zinit duration spelling.
+fn bardur(v: &str) -> Option<String> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut dot = false;
+    for c in v.chars() {
+        if c.is_ascii_digit() {
+        } else if c == '.' && !dot {
+            dot = true;
+        } else {
+            return None;
+        }
+    }
+    Some(format!("{v}s"))
+}
+
+/// dinit `soft:hard` limit into the soft value zinit keeps.
+fn soft_limit(v: &str) -> Option<String> {
+    let t = v.split(':').next().unwrap_or("").trim();
+    if t.is_empty() || t == "-" || !t.bytes().all(|b| b.is_ascii_digit()) {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn valid_env_name(s: &str) -> bool {
+    let mut it = s.bytes();
+    match it.next() {
+        Some(b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return false,
+    }
+    it.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn split_env_line(ln: &str) -> Option<(String, String)> {
+    let t = ln.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return None;
+    }
+    let i = t.find('=')?;
+    let (k, v) = (t[..i].trim(), t[i + 1..].trim());
+    if !valid_env_name(k) {
+        return None;
+    }
+    Some((k.to_string(), v.to_string()))
+}
+
+/// /etc/passwd lookup by name or numeric id: (name, uid, gid, home, shell).
+fn passwd_entry(user: &str) -> Option<(String, String, String, String, String)> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    for ln in text.lines() {
+        let f: Vec<&str> = ln.split(':').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        if f[0] == user || f[2] == user {
+            return Some((
+                f[0].to_string(),
+                f[2].to_string(),
+                f[3].to_string(),
+                f[5].to_string(),
+                f[6].to_string(),
+            ));
+        }
+    }
+    None
+}
+
 struct Converted {
     name: String,
     text: String,
@@ -189,18 +434,20 @@ fn convert_one(
     let mut stopcmd = String::new();
     let mut chain = String::new();
     let mut chainalways = false;
+    let mut notifyvar = String::new();
+    let mut rdelay = String::new();
+    let mut rcount = String::new();
+    let mut rinterval = String::new();
+    let mut run_console = false;
+    let mut export_passwd = false;
+    let mut export_svcname = false;
+    let mut extra_env: Vec<String> = Vec::new();
+    let mut extra_net: Vec<String> = Vec::new();
+    let mut extra_rl: Vec<String> = Vec::new();
+    let mut extra_cg = String::new();
 
-    for raw in file_text.lines() {
-        // strip comment like sed 's/#.*$//'
-        let no_comment = match raw.find('#') {
-            Some(i) => &raw[..i],
-            None => raw,
-        };
-        let ln = no_comment.strip_suffix('\r').unwrap_or(no_comment);
-        if is_blank_spaces(ln) {
-            continue;
-        }
-        let (k_raw, v_raw, ap) = match split_line(ln) {
+    for ln in gather_lines(file_text, in_dir, 0, n, warns) {
+        let (k_raw, v_raw, ap) = match split_line(&ln) {
             Some(t) => t,
             None => {
                 w("bad line, ignored".to_string());
@@ -208,15 +455,16 @@ fn convert_one(
             }
         };
         let k = trim_spaces(k_raw).to_string();
-        let v = trim_spaces(v_raw).to_string();
+        let v = cook_value(trim_spaces(v_raw));
         match k.as_str() {
             "type" => stype = v,
             "command" => {
+                let vv = sub_arg1(&v, n, warns);
                 if ap {
                     command.push(' ');
-                    command.push_str(&v);
+                    command.push_str(&vv);
                 } else {
-                    command = v;
+                    command = vv;
                 }
             }
             "depends-on" | "depends-ms" => {
@@ -281,6 +529,12 @@ fn convert_one(
                     } else {
                         w(format!("ready {v} ignored"));
                     }
+                } else if let Some(var) = v.strip_prefix("pipevar:") {
+                    if valid_env_name(var) {
+                        notifyvar = var.to_string();
+                    } else {
+                        w(format!("ready {v} ignored"));
+                    }
                 } else {
                     w(format!("ready {v} ignored"));
                 }
@@ -291,30 +545,137 @@ fn convert_one(
                 "on-failure" => restart = "on-failure".to_string(),
                 _ => w(format!("restart={v} ignored")),
             },
-            k if k == "restart-delay" || k.starts_with("restart-limit-") => {
-                w(format!("{k} ignored; 3-per-10s envelope used"));
+            "restart-delay" => match bardur(&v) {
+                Some(d) => rdelay = d,
+                None => w(format!("restart-delay {v} ignored")),
+            },
+            "restart-limit-interval" => match bardur(&v) {
+                Some(d) => rinterval = d,
+                None => w(format!("restart-limit-interval {v} ignored")),
+            },
+            "restart-limit-count" => {
+                if v == "0" {
+                    rcount = "0".to_string();
+                } else if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                    rcount = v;
+                } else {
+                    w(format!("restart-limit-count {v} ignored"));
+                }
             }
             "stop-command" => {
+                let vv = sub_arg1(&v, n, warns);
                 if ap {
                     stopcmd.push(' ');
-                    stopcmd.push_str(&v);
+                    stopcmd.push_str(&vv);
                 } else {
-                    stopcmd = v;
+                    stopcmd = vv;
                 }
             }
             "chain-to" => chain = v,
             "options" => {
-                if v.contains("always-chain") {
-                    chainalways = true;
+                for o in v.split_whitespace() {
+                    match o {
+                        "always-chain" => chainalways = true,
+                        "runs-on-console" => run_console = true,
+                        // inherent: the child path always sets no-new-privs.
+                        "no-new-privs" => {}
+                        _ => w(format!("option {o} ignored")),
+                    }
                 }
-                w(format!("{n}: options ignored except always-chain"));
             }
             "stop-timeout" => stop = dur(&v),
             "start-timeout" => start = dur(&v),
             "run-as" => user = v,
-            "working-dir" => wdir = v,
-            "logfile" => log = format!("file:{v}"),
-            "pid-file" => pid = v,
+            "working-dir" => wdir = sub_arg1(&v, n, warns),
+            "logfile" => log = format!("file:{}", sub_arg1(&v, n, warns)),
+            "pid-file" => pid = sub_arg1(&v, n, warns),
+            "env-file" => {
+                let q = std::path::Path::new(&v);
+                let q = if q.is_absolute() { q.to_path_buf() } else { in_dir.join(&v) };
+                match std::fs::read_to_string(&q) {
+                    Ok(t) => {
+                        for el in t.lines() {
+                            match split_env_line(el) {
+                                Some((k2, v2)) => extra_env.push(format!("env = {k2}={v2}")),
+                                None => {
+                                    let e = el.trim();
+                                    if !e.is_empty() && !e.starts_with('#') {
+                                        w(format!("env-file line ignored: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => w(format!("env-file {v} missing, ignored")),
+                }
+            }
+            "socket-listen" => {
+                if v.is_empty() || v.chars().any(char::is_whitespace) {
+                    w(format!("socket-listen {v} ignored"));
+                } else {
+                    extra_net.push(format!("listen = unix:{}", sub_arg1(&v, n, warns)));
+                }
+            }
+            "socket-permissions" | "socket-uid" | "socket-gid" => {
+                w(format!("{k} ignored; sockets bind 0600 as the service user"));
+            }
+            "term-signal" => {
+                if v != "TERM" {
+                    w(format!("term-signal {v} ignored; TERM then KILL after stop-timeout"));
+                }
+            }
+            "log-type" => match v.as_str() {
+                "file" => {
+                    if log.is_empty() {
+                        w("log-type file without logfile, ignored".to_string());
+                    }
+                }
+                "none" => {}
+                _ => w(format!("log-type {v} has no counterpart; kept as none")),
+            },
+            "log-buffer-size" | "logfile-uid" | "logfile-gid" | "logfile-permissions"
+            | "consumer-of" => {
+                w(format!("{k} ignored; file logs only"));
+            }
+            "load-options" => {
+                for o in v.split_whitespace() {
+                    match o {
+                        "export-passwd-vars" => export_passwd = true,
+                        "export-service-name" => export_svcname = true,
+                        _ => w(format!("load-option {o} ignored")),
+                    }
+                }
+            }
+            "smooth-recovery" => {
+                w("smooth-recovery ignored; restarts never stop dependents here".to_string());
+            }
+            "rlimit-nofile" | "rlimit-nproc" | "rlimit-as" => {
+                let zn = match k.as_str() {
+                    "rlimit-nofile" => "rlimit-nofile",
+                    "rlimit-nproc" => "rlimit-nproc",
+                    _ => "rlimit-as",
+                };
+                match soft_limit(&v) {
+                    Some(x) => extra_rl.push(format!("{zn} = {x}")),
+                    None => w(format!("{k} {v} ignored")),
+                }
+            }
+            "rlimit-core" | "rlimit-data" | "rlimit-addrspace" => {
+                w(format!("{k} ignored; only nofile/nproc/as exist"));
+            }
+            "nice" => w(format!("nice {v} ignored; no priority directive")),
+            "run-in-cgroup" => {
+                if v.is_empty() {
+                    w("run-in-cgroup empty, ignored".to_string());
+                } else {
+                    extra_cg = format!("cgroup = {v}");
+                }
+            }
+            "capabilities" | "securebits" => {
+                w(format!("{k} ignored; only dropping is supported, never granting"));
+            }
+            "ioprio" | "oom-score-adj" => w(format!("{k} ignored")),
+            "inittab-id" | "inittab-line" => w(format!("{k} ignored; no utmp accounting")),
             _ => w(format!("{k} ignored")),
         }
     }
@@ -357,6 +718,14 @@ fn convert_one(
             notifyfd.clear();
         } else {
             pre.push_str(&format!("exec {notifyfd}>&$ZINIT_NOTIFY_FD; "));
+        }
+    }
+    if !notifyvar.is_empty() {
+        if zt == "oneshot" || zt == "forking" {
+            w("pipevar needs a plain process, ignored".to_string());
+            notifyvar.clear();
+        } else {
+            pre.push_str(&format!("export {notifyvar}="$ZINIT_NOTIFY_FD"; "));
         }
     }
     let mut stunt = String::new();
@@ -402,20 +771,56 @@ fn convert_one(
             }
         }
     }
+    if run_console {
+        match zt_owned.as_str() {
+            "process" | "script" => zt_owned = "console".to_string(),
+            _ => w("console option needs a process service, ignored".to_string()),
+        }
+    }
     if zt_owned == "oneshot" && restart == "on-failure" {
         restart = "never".to_string();
     }
+    // dinit restarts bounded 3-per-10s by default (delay 0.2s); explicit
+    // limit keys narrow it, count 0 lifts it (unbounded).
+    let envelope = || {
+        if rcount == "0" {
+            String::new()
+        } else {
+            format!(
+                "{} restarts per {}",
+                if rcount.is_empty() { "3" } else { rcount.as_str() },
+                if rinterval.is_empty() { "10s" } else { rinterval.as_str() }
+            )
+        }
+    };
     if restart == "always" {
-        budget = "3 restarts per 10s".to_string();
+        budget = envelope();
     } else {
         match zt_owned.as_str() {
-            "process" | "forking" | "script" => {
+            "process" | "forking" | "script" | "console" => {
                 if restart.is_empty() {
                     restart = "always".to_string();
-                    budget = "3 restarts per 10s".to_string();
+                    budget = envelope();
                 }
             }
             _ => {}
+        }
+    }
+    if export_svcname {
+        extra_env.push(format!("env = DINIT_SERVICE={n}"));
+    }
+    if export_passwd {
+        let who = if user.is_empty() { "root" } else { user.as_str() };
+        match passwd_entry(who) {
+            Some((nm, uid, gid, home, shell)) => {
+                extra_env.push(format!("env = USER={nm}"));
+                extra_env.push(format!("env = LOGNAME={nm}"));
+                extra_env.push(format!("env = HOME={home}"));
+                extra_env.push(format!("env = SHELL={shell}"));
+                extra_env.push(format!("env = UID={uid}"));
+                extra_env.push(format!("env = GID={gid}"));
+            }
+            None => w(format!("export-passwd-vars: user {who} not found")),
         }
     }
     if log.is_empty() {
@@ -437,6 +842,9 @@ fn convert_one(
     if !budget.is_empty() {
         o.push_str(&format!("restart-budget = {budget}\n"));
     }
+    if !rdelay.is_empty() {
+        o.push_str(&format!("restart-delay = {rdelay}\n"));
+    }
     if !stop.is_empty() {
         o.push_str(&format!("stop-timeout = {stop}\n"));
     }
@@ -446,11 +854,23 @@ fn convert_one(
     if !user.is_empty() {
         o.push_str(&format!("user = {user}\n"));
     }
+    for e in &extra_env {
+        o.push_str(&format!("{e}\n"));
+    }
     if !log.is_empty() {
         o.push_str(&format!("log = {log}\n"));
     }
     if !ready.is_empty() {
         o.push_str(&format!("ready = {ready}\n"));
+    }
+    for e in &extra_net {
+        o.push_str(&format!("{e}\n"));
+    }
+    for e in &extra_rl {
+        o.push_str(&format!("{e}\n"));
+    }
+    if !extra_cg.is_empty() {
+        o.push_str(&format!("{extra_cg}\n"));
     }
     if zt_owned == "forking" && !pid.is_empty() {
         o.push_str(&format!("pid-file = {pid}\n"));
@@ -1150,7 +1570,44 @@ fn serve_one(
                         // devmon-quiet fallback. Supervisor up but unknown
                         // service → honest NOSERVICE.
                         if c4_dial(&ctx.zsock).is_some() {
-                            if !wr_all(s, &[NOSERVICE]) {
+                            // Instance synthesis: `base@arg` materializes
+                            // from the `base` template (`%i` expands at load,
+                            // so a verbatim copy is the correct instance).
+                            let mut served = false;
+                            if let Some(at) = svc.rfind('@') {
+                                let (base, arg) = (&svc[..at], &svc[at + 1..]);
+                                if !base.is_empty() && !arg.is_empty() {
+                                    let dst = ctx.outdir.join(format!("{svc}.conf"));
+                                    if !dst.exists() {
+                                        if let Ok(t) = std::fs::read_to_string(
+                                            ctx.outdir.join(format!("{base}.conf")),
+                                        ) {
+                                            if std::fs::write(&dst, t).is_ok() {
+                                                let _ = c4_ask(
+                                                    &ctx.zsock,
+                                                    "C compatd reload-all\n",
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(st) = z_status(&ctx.zsock, &svc) {
+                                        let mut reply =
+                                            [SERVICERECORD, 0, 0, 0, 0, 0, 0];
+                                        reply[1] = st.state;
+                                        reply[2..6].copy_from_slice(
+                                            &next_handle.to_le_bytes(),
+                                        );
+                                        reply[6] = st.target;
+                                        names.insert(next_handle, svc);
+                                        next_handle += 1;
+                                        served = wr_all(s, &reply);
+                                        if !served {
+                                            return next_handle;
+                                        }
+                                    }
+                                }
+                            }
+                            if !served && !wr_all(s, &[NOSERVICE]) {
                                 return next_handle;
                             }
                         } else {
@@ -2070,6 +2527,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let sock = path.display().to_string();
+        let rl = reloaded.clone();
         let h = std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let mut c = match conn {
@@ -2088,6 +2546,16 @@ mod tests {
                         match w[3] {
                             "a" => "R compatd 0 a running desired=up pid=99 up=1s restarts=0/3\n",
                             "b" => "R compatd 0 b stopped desired=down pid=- up=- restarts=0/3\n",
+                            w3 if w3.contains('@') => {
+                                // instances exist only once the supervisor
+                                // has reloaded after synthesis.
+                                let base = w3.split('@').next().unwrap_or("");
+                                if (base == "a" || base == "b") && rl.load(Ordering::SeqCst) {
+                                    "R compatd 0 x running desired=up pid=7 up=1s restarts=0/3\n"
+                                } else {
+                                    "E compatd 3 unknown service\n"
+                                }
+                            }
                             _ => "E compatd 3 unknown service\n",
                         }
                     } else if w.len() >= 3 && w[2] == "list" {
@@ -2129,6 +2597,86 @@ mod tests {
         let r = read_exact(client, 7);
         assert_eq!(r[0], SERVICERECORD);
         u32::from_le_bytes([r[2], r[3], r[4], r[5]])
+    }
+
+    #[test]
+    fn tokenizer_cooks_values() {
+        assert_eq!(cook_value("a  b\tc"), "a b c");
+        assert_eq!(cook_value("\"a  b\" c"), "a  b c");
+        assert_eq!(cook_value("x \\y"), "x y");
+        assert_eq!(strip_comment("command = a # tail"), "command = a ");
+        assert_eq!(strip_comment("command = \"a#b\""), "command = \"a#b\"");
+        assert_eq!(strip_comment("# full"), "");
+        let ll = logical_lines("command = a \\\n  b\nc = d\n");
+        assert_eq!(ll.len(), 2);
+        assert_eq!(cook_value(&ll[0]), "command = a b");
+        assert_eq!(sub_arg1("/bin/s $1 ${1} ${1:-x}", "s", &mut Vec::new()), "/bin/s %i %i %i");
+    }
+
+    #[test]
+    fn convert_new_keys_end_to_end() {
+        let dir = tmpout("keys-in");
+        std::fs::write(dir.join("vars.env"), "FOO=bar\n# c\nBADLINE\nEMPTY=\n").unwrap();
+        std::fs::write(dir.join("inc"), "waits-for: other\n").unwrap();
+        let text = "type = process\ncommand = /bin/srv $1 --x=\"a  b\" # run it\ndepends-on = net\nrestart-limit-count = 5\nrestart-limit-interval = 20\nrestart-delay = 0.5\nsocket-listen = /run/s.sock\nrun-in-cgroup = /sys/fs/cgroup/sys\nrlimit-nofile = 1024:4096\nrlimit-core = 0\nlog-type = buffer\noptions: runs-on-console no-new-privs bogus-opt\nload-options: export-service-name\nenv-file = vars.env\n@include inc\n";
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(text, "svc", &dir, &mut pulls, &mut befores, &mut warns)
+            .expect("converts");
+        assert!(c.text.contains("type = console\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("command = /bin/srv %i --x=a  b\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("depends = net, opt:other\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("restart-budget = 5 restarts per 20s\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("restart-delay = 0.5s\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("listen = unix:/run/s.sock\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("cgroup = /sys/fs/cgroup/sys\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("rlimit-nofile = 1024\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("env = FOO=bar\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("env = EMPTY=\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("env = DINIT_SERVICE=svc\n"), "got:\n{}", c.text);
+        let w = warns.join("\n");
+        assert!(w.contains("log-type buffer"), "got: {w}");
+        assert!(w.contains("option bogus-opt ignored"), "got: {w}");
+        assert!(w.contains("rlimit-core ignored"), "got: {w}");
+        assert!(w.contains("env-file line ignored: BADLINE"), "got: {w}");
+    }
+
+    #[test]
+    fn convert_unlimited_budget_omits_the_line() {
+        let dir = tmpout("keys0-in");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /bin/a\nrestart-limit-count = 0\n",
+            "s",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("restart = always\n"));
+        assert!(!c.text.contains("restart-budget"), "got:\n{}", c.text);
+    }
+
+    #[test]
+    fn instance_synthesized_from_template() {
+        use std::sync::atomic::Ordering;
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded.clone());
+        let out = tmpout("inst");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a %i\n").unwrap();
+        let ctx = Ctx { outdir: out.clone(), zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 96);
+        let hd = find_handle(&mut client, "", b"a@tty1");
+        assert_eq!(hd, 96);
+        assert!(out.join("a@tty1.conf").is_file());
+        assert!(reloaded.load(Ordering::SeqCst));
+        drop(client);
+        h.join().unwrap();
     }
 
     #[test]

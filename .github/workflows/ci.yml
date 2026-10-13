@@ -123,3 +123,30 @@ jobs:
           zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check out
         env:
           GH_TOKEN: ${{ github.token }}
+  keys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: new directives convert and check
+        run: |
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+          rm -rf kin kout && mkdir kin kout
+          printf 'type = process\ncommand = /bin/srv $1\ndepends-on = net\nrestart-limit-count = 5\nrestart-limit-interval = 20\nrestart-delay = 0.5\nsocket-listen = /run/s.sock\nrun-in-cgroup = /sys/fs/cgroup/sys\nrlimit-nofile = 1024:4096\nready-notification = pipevar:READY_FD\noptions: runs-on-console no-new-privs\nload-options: export-service-name\n' > kin/svc
+          printf 'type = process\ncommand = /bin/sleep 300\n' > kin/net
+          printf 'type = internal\ndepends-on = svc\n' > kin/boot
+          /tmp/zdg convert kin kout
+          grep -q '^type = console$' kout/svc.conf
+          grep -q 'command = /bin/srv %i' kout/svc.conf
+          grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf
+          grep -q '^restart-delay = 0.5s$' kout/svc.conf
+          grep -q '^listen = unix:/run/s.sock$' kout/svc.conf
+          grep -q '^cgroup = /sys/fs/cgroup/sys$' kout/svc.conf
+          grep -q '^rlimit-nofile = 1024$' kout/svc.conf
+          grep -qF 'export READY_FD="$ZINIT_NOTIFY_FD"' kout/svc.conf
+          grep -q '^env = DINIT_SERVICE=svc$' kout/svc.conf
+          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*'
+          tar xzf zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
+          zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check kout
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,5 +1,7 @@
 #!/bin/sh
 # dinit-import.sh <dinitdir> <outdir>: dinit -> zinit, texto a texto.
+# Motor heredado, comportamiento congelado: `z-dinit-generator convert` es
+# lo autoritativo (paridad byte-identica en CI sobre el corpus simple).
 # Arranque perezoso como dinit: solo boot y lo que arrastra (required +
 # waits + .d; after/before nunca arrastran) arranca solo; el resto sale
 # con `enabled = no` para arranque explícito del operador.
