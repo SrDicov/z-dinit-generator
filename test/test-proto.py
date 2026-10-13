@@ -29,6 +29,7 @@ reloaded = []
 # NOTE: never run this as root: the SHUTDOWN case writes the real
 # /proc/sysrq-trigger (CI runners are unprivileged, so it NAKs there).
 stopped = {"b"}
+lag_used = [False]
 
 
 def stub_server():
@@ -78,15 +79,15 @@ def stub_server():
                     if w[3] not in ("a", "b"):
                         rep = "E compatd 3 unknown service\n"
                     else:
-                        # lag simulation while unreloaded: `stop a` is
-                        # accepted but never lands (exercises the ACK path).
-                        # After the first reload-all everything applies, so
-                        # the later SHUTDOWN check can stop the world.
-                        if not (w[2] == "stop" and w[3] == "a" and not reloaded):
-                            if w[2] == "stop":
-                                stopped.add(w[3])
-                            else:
-                                stopped.discard(w[3])
+                        # lag simulation, one-shot: the first `stop a` is
+                        # accepted but never lands (exercises the ACK path);
+                        # later stops apply, so SHUTDOWN can stop the world.
+                        if w[2] == "stop" and w[3] == "a" and not lag_used[0]:
+                            lag_used[0] = True
+                        elif w[2] == "stop":
+                            stopped.add(w[3])
+                        else:
+                            stopped.discard(w[3])
                         rep = "R compatd 0\n"
                 elif len(w) >= 3 and w[2] == "reload-all":
                     reloaded.append(1)
