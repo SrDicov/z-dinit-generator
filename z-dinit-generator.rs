@@ -3988,7 +3988,7 @@ mod tests {
             outdir: out.clone(),
             zsock,
             sysrq: String::from("/tmp/zdg-no-such-sysrq"),
-        };;
+        };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 95);
         let ah = find_handle(&mut client, "", b"a");
