@@ -244,7 +244,9 @@ try:
     check("listenenv", c2.read(1) == bytes([50]))
     c2.raw(bytes([10, 4]))
     check("shutdown", c2.read(1) == bytes([51]))
-    # 19. handle uniqueness across connections
+    # 19. handle uniqueness across connections (close idle first:
+    # one connection is served at a time, like upstream).
+    c2.close()
     c3 = C()
     r = find(c3, "a")
     h3 = struct.unpack("<I", r[2:6])[0]
@@ -253,7 +255,6 @@ try:
     c3.raw(bytes([200]))
     check("badreq", c3.read(1) == bytes([52]))
     check("badreq-eof", c3.read(1) == b"")
-    c2.close()
     c3.close()
 
     if fails:
