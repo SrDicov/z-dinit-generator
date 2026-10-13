@@ -26,6 +26,9 @@ with open(os.path.join(OUT, "b.conf"), "w") as f:
 STUB = os.path.join(TMP, "c4.sock")
 DSOCK = os.path.join(TMP, "dinitctl")
 reloaded = []
+# NOTE: never run this as root: the SHUTDOWN case writes the real
+# /proc/sysrq-trigger (CI runners are unprivileged, so it NAKs there).
+stopped = {"b"}
 
 
 def stub_server():
@@ -57,16 +60,28 @@ def stub_server():
                 if len(w) >= 4 and w[2] == "status":
                     name = w[3]
                     base = name.split("@")[0] if "@" in name else name
-                    if name == "a" or (base == "a" and reloaded):
-                        rep = "R compatd 0 x running desired=up pid=99 up=1s restarts=0/3\n"
-                    elif name == "b" or (base == "b" and reloaded):
+                    if base not in ("a", "b"):
+                        rep = "E compatd 3 unknown service\n"
+                    elif name in stopped or base in stopped:
                         rep = "R compatd 0 x stopped desired=down pid=- up=- restarts=0/3\n"
                     else:
-                        rep = "E compatd 3 unknown service\n"
+                        rep = "R compatd 0 x running desired=up pid=99 up=1s restarts=0/3\n"
                 elif len(w) >= 3 and w[2] == "list":
-                    rep = "R compatd 0 2 a=running b=stopped\n"
+                    sa = "stopped" if "a" in stopped else "running"
+                    sb = "stopped" if "b" in stopped else "running"
+                    rep = "R compatd 0 2 a=%s b=%s\n" % (sa, sb)
                 elif len(w) >= 4 and w[2] in ("start", "stop", "restart"):
-                    rep = "R compatd 0\n" if w[3] in ("a", "b") else "E compatd 3 unknown\n"
+                    if w[3] not in ("a", "b"):
+                        rep = "E compatd 3 unknown service\n"
+                    else:
+                        # lag simulation: `stop a` is accepted but never
+                        # lands (exercises the ACK path); all else applies.
+                        if not (w[2] == "stop" and w[3] == "a"):
+                            if w[2] == "stop":
+                                stopped.add(w[3])
+                            else:
+                                stopped.discard(w[3])
+                        rep = "R compatd 0\n"
                 elif len(w) >= 3 and w[2] == "reload-all":
                     reloaded.append(1)
                     rep = "R compatd 0\n"
@@ -155,10 +170,15 @@ try:
     c1.raw(bytes([25]))
     lb = c1.read(2 * 17 + 1)
     check("list5", lb[0] == 62 and lb[17] == 62 and lb[34] == 63, repr(lb))
-    # 9. start flows: stopped->ACK, running->events+ALREADYSS, preack first
+    # 9. start lands with events+ALREADYSS; lagging stop answers ACK.
     c1.raw(bytes([3, 0]) + struct.pack("<I", h_b))
-    check("start-ack", c1.read(1) == bytes([50]))
-    c1.raw(bytes([3, 128]) + struct.pack("<I", h_a))
+    e1 = c1.read(17)
+    check("start-ev", e1[6] == 0, repr(e1))
+    c1.read(21)
+    check("start-lands", c1.read(1) == bytes([61]))
+    c1.raw(bytes([4, 0]) + struct.pack("<I", h_a))
+    check("stop-lags-ack", c1.read(1) == bytes([50]))
+    c1.raw(bytes([3, 128]) + struct.pack("<I", h_b))
     check("preack", c1.read(1) == bytes([79]))
     e1 = c1.read(17)
     check("event", e1[0] == 100 and e1[1] == 17 and e1[6] == 0, repr(e1))
