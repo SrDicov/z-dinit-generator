@@ -417,7 +417,11 @@ fn convert_one(
     befores: &mut Vec<(String, String)>,
     warns: &mut Vec<String>,
 ) -> Option<Converted> {
-    let mut w = |m: String| warns.push(format!("{n}: {m}"));
+    macro_rules! w {
+        ($m:expr) => {
+            warns.push(format!("{n}: {}", $m))
+        };
+    }
     let mut stype = String::new();
     let mut command = String::new();
     let mut deps = String::new();
@@ -450,7 +454,7 @@ fn convert_one(
         let (k_raw, v_raw, ap) = match split_line(&ln) {
             Some(t) => t,
             None => {
-                w("bad line, ignored".to_string());
+                w!("bad line, ignored".to_string());
                 continue;
             }
         };
@@ -518,7 +522,7 @@ fn convert_one(
                             pulls.entry(n.to_string()).or_default().push(e);
                         }
                     }
-                    Err(_) => w(format!("{k} {v} missing, ignored")),
+                    Err(_) => w!(format!("{k} {v} missing, ignored")),
                 }
             }
             "ready-notification" => {
@@ -527,31 +531,31 @@ fn convert_one(
                     if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
                         notifyfd = rest.to_string();
                     } else {
-                        w(format!("ready {v} ignored"));
+                        w!(format!("ready {v} ignored"));
                     }
                 } else if let Some(var) = v.strip_prefix("pipevar:") {
                     if valid_env_name(var) {
                         notifyvar = var.to_string();
                     } else {
-                        w(format!("ready {v} ignored"));
+                        w!(format!("ready {v} ignored"));
                     }
                 } else {
-                    w(format!("ready {v} ignored"));
+                    w!(format!("ready {v} ignored"));
                 }
             }
             "restart" => match v.as_str() {
                 "true" | "yes" | "1" => restart = "always".to_string(),
                 "false" | "no" | "0" => restart = "never".to_string(),
                 "on-failure" => restart = "on-failure".to_string(),
-                _ => w(format!("restart={v} ignored")),
+                _ => w!(format!("restart={v} ignored")),
             },
             "restart-delay" => match bardur(&v) {
                 Some(d) => rdelay = d,
-                None => w(format!("restart-delay {v} ignored")),
+                None => w!(format!("restart-delay {v} ignored")),
             },
             "restart-limit-interval" => match bardur(&v) {
                 Some(d) => rinterval = d,
-                None => w(format!("restart-limit-interval {v} ignored")),
+                None => w!(format!("restart-limit-interval {v} ignored")),
             },
             "restart-limit-count" => {
                 if v == "0" {
@@ -559,7 +563,7 @@ fn convert_one(
                 } else if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
                     rcount = v;
                 } else {
-                    w(format!("restart-limit-count {v} ignored"));
+                    w!(format!("restart-limit-count {v} ignored"));
                 }
             }
             "stop-command" => {
@@ -579,7 +583,7 @@ fn convert_one(
                         "runs-on-console" => run_console = true,
                         // inherent: the child path always sets no-new-privs.
                         "no-new-privs" => {}
-                        _ => w(format!("option {o} ignored")),
+                        _ => w!(format!("option {o} ignored")),
                     }
                 }
             }
@@ -600,54 +604,54 @@ fn convert_one(
                                 None => {
                                     let e = el.trim();
                                     if !e.is_empty() && !e.starts_with('#') {
-                                        w(format!("env-file line ignored: {e}"));
+                                        w!(format!("env-file line ignored: {e}"));
                                     }
                                 }
                             }
                         }
                     }
-                    Err(_) => w(format!("env-file {v} missing, ignored")),
+                    Err(_) => w!(format!("env-file {v} missing, ignored")),
                 }
             }
             "socket-listen" => {
                 if v.is_empty() || v.chars().any(char::is_whitespace) {
-                    w(format!("socket-listen {v} ignored"));
+                    w!(format!("socket-listen {v} ignored"));
                 } else {
                     extra_net.push(format!("listen = unix:{}", sub_arg1(&v, n, warns)));
                 }
             }
             "socket-permissions" | "socket-uid" | "socket-gid" => {
-                w(format!("{k} ignored; sockets bind 0600 as the service user"));
+                w!(format!("{k} ignored; sockets bind 0600 as the service user"));
             }
             "term-signal" => {
                 if v != "TERM" {
-                    w(format!("term-signal {v} ignored; TERM then KILL after stop-timeout"));
+                    w!(format!("term-signal {v} ignored; TERM then KILL after stop-timeout"));
                 }
             }
             "log-type" => match v.as_str() {
                 "file" => {
                     if log.is_empty() {
-                        w("log-type file without logfile, ignored".to_string());
+                        w!("log-type file without logfile, ignored".to_string());
                     }
                 }
                 "none" => {}
-                _ => w(format!("log-type {v} has no counterpart; kept as none")),
+                _ => w!(format!("log-type {v} has no counterpart; kept as none")),
             },
             "log-buffer-size" | "logfile-uid" | "logfile-gid" | "logfile-permissions"
             | "consumer-of" => {
-                w(format!("{k} ignored; file logs only"));
+                w!(format!("{k} ignored; file logs only"));
             }
             "load-options" => {
                 for o in v.split_whitespace() {
                     match o {
                         "export-passwd-vars" => export_passwd = true,
                         "export-service-name" => export_svcname = true,
-                        _ => w(format!("load-option {o} ignored")),
+                        _ => w!(format!("load-option {o} ignored")),
                     }
                 }
             }
             "smooth-recovery" => {
-                w("smooth-recovery ignored; restarts never stop dependents here".to_string());
+                w!("smooth-recovery ignored; restarts never stop dependents here".to_string());
             }
             "rlimit-nofile" | "rlimit-nproc" | "rlimit-as" => {
                 let zn = match k.as_str() {
@@ -657,26 +661,26 @@ fn convert_one(
                 };
                 match soft_limit(&v) {
                     Some(x) => extra_rl.push(format!("{zn} = {x}")),
-                    None => w(format!("{k} {v} ignored")),
+                    None => w!(format!("{k} {v} ignored")),
                 }
             }
             "rlimit-core" | "rlimit-data" | "rlimit-addrspace" => {
-                w(format!("{k} ignored; only nofile/nproc/as exist"));
+                w!(format!("{k} ignored; only nofile/nproc/as exist"));
             }
-            "nice" => w(format!("nice {v} ignored; no priority directive")),
+            "nice" => w!(format!("nice {v} ignored; no priority directive")),
             "run-in-cgroup" => {
                 if v.is_empty() {
-                    w("run-in-cgroup empty, ignored".to_string());
+                    w!("run-in-cgroup empty, ignored".to_string());
                 } else {
                     extra_cg = format!("cgroup = {v}");
                 }
             }
             "capabilities" | "securebits" => {
-                w(format!("{k} ignored; only dropping is supported, never granting"));
+                w!(format!("{k} ignored; only dropping is supported, never granting"));
             }
-            "ioprio" | "oom-score-adj" => w(format!("{k} ignored")),
-            "inittab-id" | "inittab-line" => w(format!("{k} ignored; no utmp accounting")),
-            _ => w(format!("{k} ignored")),
+            "ioprio" | "oom-score-adj" => w!(format!("{k} ignored")),
+            "inittab-id" | "inittab-line" => w!(format!("{k} ignored; no utmp accounting")),
+            _ => w!(format!("{k} ignored")),
         }
     }
 
@@ -684,7 +688,7 @@ fn convert_one(
         "process" => "process",
         "bgprocess" => {
             if pid.is_empty() {
-                w("bgprocess without pid-file as process".to_string());
+                w!("bgprocess without pid-file as process".to_string());
                 "process"
             } else {
                 "forking"
@@ -698,12 +702,12 @@ fn convert_one(
             "oneshot"
         }
         _ => {
-            w(format!("type '{stype}' unknown, skipped"));
+            w!(format!("type '{stype}' unknown, skipped"));
             return None;
         }
     };
     if command.is_empty() {
-        w("no command, skipped".to_string());
+        w!("no command, skipped".to_string());
         return None;
     }
 
@@ -714,7 +718,7 @@ fn convert_one(
     }
     if !notifyfd.is_empty() {
         if zt == "oneshot" || zt == "forking" {
-            w("pipefd needs a plain process, ignored".to_string());
+            w!("pipefd needs a plain process, ignored".to_string());
             notifyfd.clear();
         } else {
             pre.push_str(&format!("exec {notifyfd}>&$ZINIT_NOTIFY_FD; "));
@@ -722,7 +726,7 @@ fn convert_one(
     }
     if !notifyvar.is_empty() {
         if zt == "oneshot" || zt == "forking" {
-            w("pipevar needs a plain process, ignored".to_string());
+            w!("pipevar needs a plain process, ignored".to_string());
             notifyvar.clear();
         } else {
             pre.push_str(&format!("export {notifyvar}=\"$ZINIT_NOTIFY_FD\"; "));
@@ -735,7 +739,7 @@ fn convert_one(
     let mut tail = String::new();
     if !chain.is_empty() {
         if !valid_name(&chain) {
-            w(format!("chain-to {chain} ignored"));
+            w!(format!("chain-to {chain} ignored"));
             chain.clear();
         }
     }
@@ -754,13 +758,13 @@ fn convert_one(
     if !pre.is_empty() || !stunt.is_empty() || !tail.is_empty() {
         if zt == "forking" || zt == "oneshot" {
             if !wdir.is_empty() {
-                w("working-dir needs a shell, ignored".to_string());
+                w!("working-dir needs a shell, ignored".to_string());
             }
             if !stopcmd.is_empty() {
-                w("stop-command needs a shell, ignored".to_string());
+                w!("stop-command needs a shell, ignored".to_string());
             }
             if !chain.is_empty() {
-                w("chain-to needs a shell, ignored".to_string());
+                w!("chain-to needs a shell, ignored".to_string());
             }
         } else {
             zt_owned = "script".to_string();
@@ -774,7 +778,7 @@ fn convert_one(
     if run_console {
         match zt_owned.as_str() {
             "process" | "script" => zt_owned = "console".to_string(),
-            _ => w("console option needs a process service, ignored".to_string()),
+            _ => w!("console option needs a process service, ignored".to_string()),
         }
     }
     if zt_owned == "oneshot" && restart == "on-failure" {
@@ -820,7 +824,7 @@ fn convert_one(
                 extra_env.push(format!("env = UID={uid}"));
                 extra_env.push(format!("env = GID={gid}"));
             }
-            None => w(format!("export-passwd-vars: user {who} not found")),
+            None => w!(format!("export-passwd-vars: user {who} not found")),
         }
     }
     if log.is_empty() {
