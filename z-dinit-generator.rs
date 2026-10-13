@@ -792,9 +792,7 @@ fn convert_one(
         // Raw shell text, quotes intact: the shell groups exactly like
         // dinit's own tokenizer did (verified: zero quoted commands in
         // the 63-service Chimera corpus, so this path is the exception).
-        if run_console {
-            w!("console lost: a quoted command runs as script, with no console");
-        }
+        // Console loss (if requested) is reported once, below.
         zt_owned = "script".to_string();
         if !stunt.is_empty() || !tail.is_empty() {
             command = format!("{stunt}{pre}{command}{tail}");
@@ -822,12 +820,17 @@ fn convert_one(
         }
     }
     if run_console {
-        match zt_owned.as_str() {
-            "process" | "script" => {
-                zt_owned = "console".to_string();
-                extra_tty = "tty = /dev/console".to_string();
-            }
-            _ => w!("console option needs a process service, ignored".to_string()),
+        // Only a directly-executed process can take a console: anything
+        // the shell must parse (quotes, cd/trap/chain preludes) keeps its
+        // shell and loses the console, loudly. There is no console+shell
+        // kind to map to.
+        if zt == "process" && !quoted && pre.is_empty() && stunt.is_empty() && tail.is_empty() {
+            zt_owned = "console".to_string();
+            extra_tty = "tty = /dev/console".to_string();
+        } else if zt_owned == "process" || zt_owned == "script" {
+            w!("console lost: the command needs a shell, which has no console");
+        } else {
+            w!("console option needs a process service, ignored".to_string());
         }
     }
     if zt_owned == "oneshot" && restart == "on-failure" {
