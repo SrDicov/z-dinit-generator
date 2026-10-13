@@ -250,27 +250,28 @@ fn has_bare_hash(ln: &str) -> bool {
 }
 
 /// Join `\\`-continued lines with one space (odd run = continuation).
-fn logical_lines(text: &str) -> Vec<String> {
+/// Returns each logical line with whether it used a join: dinit has no
+/// continuations, so a file relying on one is already broken there and
+/// the caller warns loudly about the divergence.
+fn logical_lines(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut joined = false;
     for raw in text.lines() {
         let ln = raw.strip_suffix('\r').unwrap_or(raw);
         let t = ln.trim_end();
         let bs = t.len() - t.trim_end_matches('\\').len();
         if bs % 2 == 1 {
-            // Divergence, announced by the caller: dinit has no line
-            // continuations, so a file relying on one is already broken
-            // there; joining keeps the service alive here.
             cur.push_str(&t[..t.len() - 1]);
             cur.push(' ');
-            cur.push('\u{1}');
+            joined = true;
         } else {
             cur.push_str(ln);
-            out.push(std::mem::take(&mut cur));
+            out.push((std::mem::take(&mut cur), std::mem::take(&mut joined)));
         }
     }
     if !cur.trim().is_empty() {
-        out.push(cur);
+        out.push((cur, joined));
     }
     out
 }
@@ -284,11 +285,10 @@ fn gather_lines(
     warns: &mut Vec<String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for ln in logical_lines(text) {
-        if ln.contains('\u{1}') {
+    for (ln, joined) in logical_lines(text) {
+        if joined {
             warns.push(format!("{n}: line continuation joined; dinit has none"));
         }
-        let ln = ln.replace('\u{1}', "");
         let t = trim_spaces(&ln);
         if t.is_empty() {
             continue;
@@ -3372,7 +3372,9 @@ mod tests {
         assert_eq!(strip_comment("# full"), "");
         let ll = logical_lines("command = a \\\n  b\nc = d\n");
         assert_eq!(ll.len(), 2);
-        assert_eq!(cook_value(&ll[0]), "command = a b");
+        assert_eq!(ll[0].1, true);
+        assert_eq!(cook_value(&ll[0].0), "command = a b");
+        assert_eq!(ll[1].1, false);
         assert_eq!(sub_arg1("/bin/s $1 ${1} ${1:-x}", "s", &mut Vec::new()), "/bin/s %i %i %i");
     }
 
