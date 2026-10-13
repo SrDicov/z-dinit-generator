@@ -146,9 +146,12 @@ jobs:
           grep -q '^rlimit-nofile = 1024$' kout/svc.conf
           grep -qF 'export READY_FD="$ZINIT_NOTIFY_FD"' kout/svc.conf
           grep -q '^env = DINIT_SERVICE=svc$' kout/svc.conf
-          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*'
+          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*' || { echo DOWNLOAD_FAILED; exit 1; }
+          ls -la ./*.tar.gz
           tar xzf zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
+          echo "--- svc.conf ---"
           cat kout/svc.conf
+          echo "--- check ---"
           zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check kout
         env:
           GH_TOKEN: ${{ github.token }}
