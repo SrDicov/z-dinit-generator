@@ -151,8 +151,9 @@ fn split_line(ln: &str) -> Option<(&str, &str, bool)> {
     None
 }
 
-/// dinit value cooking (dinit-service(5)): `"..."` keeps its content
-/// literally, `\\x` escapes, unquoted whitespace runs collapse to one space.
+/// dinit value cooking (load-service.h, not the manpage): only `"..."`
+/// groups (single quotes are literal characters); `\\x` escapes;
+/// unquoted whitespace runs collapse to one space.
 fn cook_value(raw: &str) -> String {
     let mut o = String::new();
     let mut it = raw.chars().peekable();
@@ -173,6 +174,10 @@ fn cook_value(raw: &str) -> String {
             }
         } else if c == '"' {
             in_q = true;
+        } else if c == '\'' {
+            // literal upstream: kept, and the spaces around it still split.
+            o.push(c);
+            space = false;
         } else if c == '\\' {
             if let Some(e) = it.next() {
                 o.push(e);
@@ -194,7 +199,10 @@ fn cook_value(raw: &str) -> String {
     o
 }
 
-/// A `#` starts a comment at line start or after whitespace (quotes honored).
+/// A `#` starts a comment at line start or after whitespace (double
+/// quotes honored; single quotes are literal, like upstream). A `#`
+/// glued to text is INVALID dinit (load error); it stays literal here
+/// and the caller warns loudly about the divergence.
 fn strip_comment(ln: &str) -> &str {
     let b = ln.as_bytes();
     let mut in_q = false;
@@ -217,6 +225,30 @@ fn strip_comment(ln: &str) -> &str {
     ln
 }
 
+/// A `#` glued to text (outside double quotes): real dinit rejects the
+/// whole file; we keep it literal and warn instead of dropping a service.
+fn has_bare_hash(ln: &str) -> bool {
+    let b = ln.as_bytes();
+    let mut in_q = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_q {
+            if c == b'"' {
+                in_q = false;
+            } else if c == b'\\' {
+                i += 1;
+            }
+        } else if c == b'"' {
+            in_q = true;
+        } else if c == b'#' && !(i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Join `\\`-continued lines with one space (odd run = continuation).
 fn logical_lines(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -226,8 +258,12 @@ fn logical_lines(text: &str) -> Vec<String> {
         let t = ln.trim_end();
         let bs = t.len() - t.trim_end_matches('\\').len();
         if bs % 2 == 1 {
+            // Divergence, announced by the caller: dinit has no line
+            // continuations, so a file relying on one is already broken
+            // there; joining keeps the service alive here.
             cur.push_str(&t[..t.len() - 1]);
             cur.push(' ');
+            cur.push('\u{1}');
         } else {
             cur.push_str(ln);
             out.push(std::mem::take(&mut cur));
@@ -249,6 +285,10 @@ fn gather_lines(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for ln in logical_lines(text) {
+        if ln.contains('\u{1}') {
+            warns.push(format!("{n}: line continuation joined; dinit has none"));
+        }
+        let ln = ln.replace('\u{1}', "");
         let t = trim_spaces(&ln);
         if t.is_empty() {
             continue;
@@ -460,6 +500,9 @@ fn convert_one(
     let mut extra_tty = String::new();
 
     for ln in gather_lines(file_text, in_dir, 0, n, warns) {
+        if has_bare_hash(&ln) {
+            warns.push(format!("{n}: hashmark without whitespace is invalid dinit; kept literal"));
+        }
         let (k_raw, v_raw, ap) = match split_line(&ln) {
             Some(t) => t,
             None => {
@@ -779,7 +822,7 @@ fn convert_one(
             );
         }
     }
-    let quoted = command_raw.contains('"') || command_raw.contains('\'');
+    let quoted = command_raw.contains('"');
     if quoted {
         if zt == "process" {
             command = command_raw.clone();
