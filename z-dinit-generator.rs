@@ -725,7 +725,7 @@ fn convert_one(
             w("pipevar needs a plain process, ignored".to_string());
             notifyvar.clear();
         } else {
-            pre.push_str(&format!("export {notifyvar}="$ZINIT_NOTIFY_FD"; "));
+            pre.push_str(&format!("export {notifyvar}=\"$ZINIT_NOTIFY_FD\"; "));
         }
     }
     let mut stunt = String::new();
