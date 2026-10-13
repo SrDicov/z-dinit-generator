@@ -75,6 +75,8 @@ jobs:
           sh -n dinit-import.sh
           sh -n dinitctl
           sh test/test-dinitctl.sh
+          bash -n PKGBUILD
+          python3 -m py_compile chimera-template.py && echo "templates ok"
       - name: fixtures
         run: |
           rm -rf in out && mkdir in out
