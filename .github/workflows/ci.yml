@@ -153,7 +153,7 @@ jobs:
           cat kout/svc.conf
           cat -A kout/svc.conf | head -n 3
           grep -q '^type = console$' kout/svc.conf || { echo "MISS: ^type = console$ in kout/svc.conf"; exit 1; }
-          grep -qF 'exec /bin/srv %i' kout/svc.conf || { echo "MISS: exec /bin/srv %i in kout/svc.conf"; exit 1; }
+          grep -q '^command = /bin/srv %i$' kout/svc.conf || { echo "MISS: ^command = /bin/srv %i$ in kout/svc.conf"; exit 1; }
           grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf || { echo "MISS: ^restart-budget = 5 restarts per 20s$ in kout/svc.conf"; exit 1; }
           grep -q '^restart-delay = 500ms$' kout/svc.conf || { echo "MISS: ^restart-delay = 500ms$ in kout/svc.conf"; exit 1; }
           grep -q '^tty = /dev/console$' kout/svc.conf || { echo "MISS: ^tty = /dev/console$ in kout/svc.conf"; exit 1; }
