@@ -5,7 +5,7 @@
 //   convert <dinitdir> <outdir>   live conversion, text in / text out (mode 1)
 //   watch <dinitdir> <outdir>      background real-time translator (mode 2)
 //   dinitctl <args...>             dinit CLI emulator over zinit C4
-//   compatd [/run/dinitctl]        minimal dinit-protocol server (devmon)
+//   compatd [/run/dinitctl] [--out DIR] full dinit-protocol server (devmon/dinitctl)
 //   start [--out DIR]              live switch: convert system dirs, install
 //                                  compatd + watch services, print next steps
 //
@@ -23,17 +23,66 @@ const DEFAULT_SOCKET: &str = "/run/zinit/ctl";
 const SOCKET_ENV: &str = "ZINIT_SOCKET";
 const DINIT_SOCK_DEFAULT: &str = "/run/dinitctl";
 
-// --- dinit protocol (compatd) ---
+// --- dinit protocol (compatd): numbers mirror control-cmds.h, dinit 0.20 / v7 ---
 const QUERYVERSION: u8 = 0;
 const FINDSERVICE: u8 = 1;
 const LOADSERVICE: u8 = 2;
+const STARTSERVICE: u8 = 3;
+const STOPSERVICE: u8 = 4;
 const WAKESERVICE: u8 = 5;
+const RELEASESERVICE: u8 = 6;
+const UNPINSERVICE: u8 = 7;
+const LISTSERVICES: u8 = 8;
+const UNLOADSERVICE: u8 = 9;
+const SHUTDOWN: u8 = 10;
+const ADD_DEP: u8 = 11;
+const REM_DEP: u8 = 12;
+const QUERY_LOAD_MECH: u8 = 13;
+const ENABLESERVICE: u8 = 14;
+const QUERYSERVICENAME: u8 = 15;
+const RELOADSERVICE: u8 = 16;
+const SETENV: u8 = 17;
+const SERVICESTATUSQ: u8 = 18;
+const SETTRIGGER: u8 = 19;
+const CATLOG: u8 = 20;
+const SIGNALQ: u8 = 21;
+const QUERYSERVICEDSCDIR: u8 = 22;
 const CLOSEHANDLE: u8 = 23;
+const GETALLENV: u8 = 24;
+const LISTSERVICES5: u8 = 25;
+const SERVICESTATUS5Q: u8 = 26;
+const LISTENENV: u8 = 27;
+const SERVICESTATUS6Q: u8 = 28;
+const ENABLE_SERVICE_V7: u8 = 29;
+const REM_DEP_V7: u8 = 30;
+const ACK: u8 = 50;
+const NAK: u8 = 51;
+const BADREQ: u8 = 52;
 const CPVERSION: u8 = 58;
 const SERVICERECORD: u8 = 59;
-const ACK: u8 = 50;
-const BADREQ: u8 = 52;
+const NOSERVICE: u8 = 60;
+const ALREADYSS: u8 = 61;
+const SVCINFO: u8 = 62;
+const LISTDONE: u8 = 63;
+const LOADER_MECH: u8 = 64;
+const SERVICENAME: u8 = 66;
+const SERVICESTATUSR: u8 = 70;
+const SERVICE_LOG: u8 = 73;
+const SIGNAL_NOPID: u8 = 74;
+const SIGNAL_BADSIG: u8 = 75;
+const SIGNAL_KILLERR: u8 = 76;
+const SVCDSCDIR: u8 = 77;
+const ALLENV: u8 = 78;
+const PREACK: u8 = 79;
+const SERVICEEVENT: u8 = 100;
+const SERVICEEVENT5: u8 = 101;
 const VER_REPLY: [u8; 5] = [CPVERSION, 1, 0, 7, 0];
+// dinit service states (service-constants.h): STOPPED 0, STARTING 1, STARTED 2, STOPPING 3.
+const ST_STOPPED: u8 = 0;
+const ST_STARTED: u8 = 2;
+// dinit stop reasons: NORMAL 0 .. TERMINATED 6; FAILED 3 marks an exhausted loop.
+// dinit dependency types: REGULAR 0, WAITS_FOR 2, MILESTONE 3 (the only three
+// ADD_DEP accepts; BEFORE 4 / AFTER 5 never cross the wire).
 
 fn warn(msg: &str) {
     eprintln!("z-dinit-generator: {msg}");
@@ -43,7 +92,7 @@ fn usage() -> i32 {
     eprintln!(
         "usage: z-dinit-generator <convert|watch|dinitctl|compatd|start> [...]\n\
          convert <dinitdir> <outdir> | watch <dinitdir>... <outdir> |\n\
-         dinitctl <cmd> [args] | compatd [/run/dinitctl] | start [--out DIR]"
+         dinitctl <cmd> [args] | compatd [/run/dinitctl] [--out DIR] | start [--out DIR]"
     );
     2
 }
@@ -731,8 +780,6 @@ fn cmd_dinitctl(args: &[String]) -> i32 {
     }
 }
 
-// ---------- compatd ----------
-
 fn rd_n(s: &mut UnixStream, mut buf: &mut [u8]) -> bool {
     while !buf.is_empty() {
         match s.read(buf) {
@@ -760,94 +807,907 @@ fn rd_u16(s: &mut UnixStream) -> Option<u16> {
     rd_n(s, &mut b).then(|| u16::from_le_bytes(b))
 }
 
-fn zinit_start_best_effort(name: &str) {
-    let sock = zinit_socket(None);
-    let frame = format!("C compatd start {name}\n");
-    // 2s cap so a wedged supervisor cannot wedge devmon.
-    let _ = (|| -> Result<(), ()> {
-        let io = UnixStream::connect(&sock).map_err(|_| ())?;
-        let _ = io.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-        let mut io = BufReader::new(io);
-        io.get_mut().write_all(frame.as_bytes()).map_err(|_| ())?;
-        let mut reply = String::new();
-        io.read_line(&mut reply).map_err(|_| ())?;
-        Ok(())
-    })();
+// ---------- compatd: full dinit control-protocol server ----------//
+// Speaks protocol v7 (dinit 0.20, control-cmds.h) over /run/dinitctl so
+// devmon, dinitctl and libdinitctl clients work unchanged. Every command
+// is either served for real through zinit C4 or refused with the same
+// reply dinit itself would send:
+//
+// * state queries (FIND/LOAD/STATUS/LIST/NAME) read live zinit state;
+//   unknown services get NOSERVICE, bad handles NAK, malformed packets
+//   BADREQ + close, exactly like control.cc.
+// * START/STOP/WAKE/RELEASE drive `zctl start/stop/restart`; already-there
+//   answers ALREADYSS, failures NAK, and a state-change emits both event
+//   packets (SERVICEEVENT + SERVICEEVENT5) so `dinitctl --wait` works.
+// * ADD/REM/ENABLE (+V7) persist into the generated .conf files and
+//   `reload-all` (dependencies are file-bound under zinit); removal of a
+//   missing edge is NAK, cycles are NAKed before they can break a boot.
+// * No counterpart exists for pin/unload/shutdown/trigger/signal/env:
+//   UNPIN ACKs (nothing is ever pinned), RELOAD maps to `reload-all`,
+//   SETENV/LISTENENV are accepted no-ops with an empty environment
+//   (matches the dinitctl shim), everything else gets the honest NAK.
+//   WAKE starts unconditionally — real WAKE needs a started dependent,
+//   which is invisible without the plan (documented divergence, and what
+//   keeps devmon quiet).
+//
+// No dependencies, no Cargo project: `rustc -O --edition=2021`.
+// Usage: compatd [/run/dinitctl] [--out DIR]. Exit nonzero only when it
+// cannot bind.
+
+/// Live view of one service, parsed from `zctl status` output.
+struct ZStatus {
+    state: u8,
+    target: u8,
+    pid: i32,
+    has_pid: bool,
+    exhausted: bool,
 }
 
-fn serve_one(s: &mut UnixStream, mut next: u32, names: &mut BTreeMap<u32, String>) -> u32 {
+fn c4_dial(sock: &str) -> Option<BufReader<UnixStream>> {
+    let io = UnixStream::connect(sock).ok()?;
+    let _ = io.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    Some(BufReader::new(io))
+}
+
+fn c4_ask(sock: &str, frame: &str) -> Option<String> {
+    let mut io = c4_dial(sock)?;
+    io.get_mut().write_all(frame.as_bytes()).ok()?;
+    let mut reply = String::new();
+    io.read_line(&mut reply).ok()?;
+    Some(reply)
+}
+
+fn parse_status(reply: &str) -> Option<ZStatus> {
+    // `R <id> 0 <name> <state> desired=<up|down> pid=<n|-> up=... restarts=a/b`
+    let t: Vec<&str> = reply.split_whitespace().collect();
+    if t.len() < 8 || t[0] != "R" {
+        return None;
+    }
+    let state = match t[4] {
+        "running" => ST_STARTED,
+        "starting" => 1,
+        "stopping" => 3,
+        _ => ST_STOPPED,
+    };
+    let target = if t[5] == "desired=up" { ST_STARTED } else { ST_STOPPED };
+    let (pid, has_pid) = match t[6].strip_prefix("pid=") {
+        Some("-") | None => (-1, false),
+        Some(n) => (n.parse().unwrap_or(-1), true),
+    };
+    let (cur, max) = t
+        .iter()
+        .find(|w| w.starts_with("restarts="))
+        .and_then(|w| w["restarts=".len()..].split_once('/'))
+        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+        .unwrap_or((0, 0));
+    // ponytail: exhausted-loop heuristic; true exit reasons need a supervisor channel.
+    let exhausted = max > 0 && cur >= max;
+    Some(ZStatus {
+        state,
+        target,
+        pid,
+        has_pid,
+        exhausted,
+    })
+}
+
+fn z_status(sock: &str, name: &str) -> Option<ZStatus> {
+    if name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    parse_status(&c4_ask(sock, &format!("C compatd status {name}\n"))?)
+}
+
+fn z_list(sock: &str) -> Option<Vec<(String, String)>> {
+    // `R <id> 0 <N> <name>=<state> ...`
+    let reply = c4_ask(sock, "C compatd list\n")?;
+    let t: Vec<&str> = reply.split_whitespace().collect();
+    if t.len() < 4 || t[0] != "R" {
+        return None;
+    }
+    let mut out = Vec::new();
+    for w in &t[4..] {
+        if let Some((n, s)) = w.split_once('=') {
+            out.push((n.to_string(), s.to_string()));
+        }
+    }
+    Some(out)
+}
+
+fn z_act(sock: &str, verb: &str, name: &str) -> bool {
+    if name.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match c4_ask(sock, &format!("C compatd {verb} {name}\n")) {
+        Some(r) => r.starts_with("R "),
+        None => false,
+    }
+}
+
+fn z_state_tok(tok: &str) -> u8 {
+    match tok {
+        "running" => ST_STARTED,
+        "starting" => 1,
+        "stopping" => 3,
+        _ => ST_STOPPED,
+    }
+}
+
+/// 10-byte v1-4 status buffer (control.cc fill_status_buffer, LP64).
+fn status_buf(st: &ZStatus) -> Vec<u8> {
+    let mut b = vec![0u8; 10];
+    b[0] = st.state;
+    b[1] = st.target;
+    if st.has_pid {
+        b[2] = 16;
+    }
+    // ponytail: stop reason is a heuristic (exhausted loop => FAILED), the
+    // supervisor exposes no EXECFAILED/TIMEDOUT channel to ask through.
+    b[3] = if st.exhausted { 3 } else { 0 };
+    if st.has_pid {
+        b[6..10].copy_from_slice(&st.pid.to_le_bytes());
+    }
+    b
+}
+
+/// 14-byte v5 buffer: si_code + si_status instead of one pid/exit word.
+fn status_buf5(st: &ZStatus) -> Vec<u8> {
+    let mut b = vec![0u8; 14];
+    b[0] = st.state;
+    b[1] = st.target;
+    if st.has_pid {
+        b[2] = 16;
+    }
+    b[3] = if st.exhausted { 3 } else { 0 };
+    if st.has_pid {
+        b[6..10].copy_from_slice(&st.pid.to_le_bytes());
+    }
+    b
+}
+
+/// 30-byte v6 buffer: v5 + conf mtime as timespec (genuinely ours: the
+/// descriptions live in files, so the modification time is exact).
+fn status_buf6(st: &ZStatus, mtime: (i64, i64)) -> Vec<u8> {
+    let mut b = status_buf5(st);
+    b.extend_from_slice(&mtime.0.to_le_bytes());
+    b.extend_from_slice(&mtime.1.to_le_bytes());
+    b
+}
+
+fn conf_mtime(outdir: &std::path::Path, name: &str) -> (i64, i64) {
+    let md = std::fs::metadata(outdir.join(format!("{name}.conf")));
+    let t = md
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    match t {
+        Some(d) => (d.as_secs() as i64, d.subsec_nanos() as i64),
+        None => (0, 0),
+    }
+}
+
+fn emit_events(s: &mut UnixStream, handle: u32, ev: u8, st: &ZStatus) -> bool {
+    // Both generations, like control.cc: [100,len17,h,ev,s10] + [101,len21,h,ev,s14].
+    let s10 = status_buf(st);
+    let s5 = status_buf5(st);
+    let mut p1 = Vec::with_capacity(17);
+    p1.push(SERVICEEVENT);
+    p1.push(17);
+    p1.extend_from_slice(&handle.to_le_bytes());
+    p1.push(ev);
+    p1.extend_from_slice(&s10);
+    let mut p5 = Vec::with_capacity(21);
+    p5.push(SERVICEEVENT5);
+    p5.push(21);
+    p5.extend_from_slice(&handle.to_le_bytes());
+    p5.push(ev);
+    p5.extend_from_slice(&s5);
+    wr_all(s, &p1) && wr_all(s, &p5)
+}
+
+/// dinit name check for the wire (load-service.h): only empty and a
+/// leading '.'/'@' are rejected — the loop after it is dead code upstream,
+/// so anything else (including '+', "..", a second '@') is accepted.
+fn valid_proto_name(n: &[u8]) -> bool {
+    !n.is_empty() && n[0] != b'.' && n[0] != b'@'
+}
+
+struct Ctx {
+    outdir: std::path::PathBuf,
+    zsock: String,
+}
+
+fn read_depends(outdir: &std::path::Path, from: &str) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(outdir.join(format!("{from}.conf"))).ok()?;
+    for l in text.lines() {
+        if let Some(rest) = l.strip_prefix("depends = ") {
+            return Some(rest.split(", ").map(|s| s.to_string()).collect());
+        }
+    }
+    Some(Vec::new())
+}
+
+fn write_depends(outdir: &std::path::Path, from: &str, deps: &[String]) -> bool {
+    let p = outdir.join(format!("{from}.conf"));
+    let cur = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let mut out = String::new();
+    let mut hit = false;
+    for l in cur.lines() {
+        if l.starts_with("depends = ") {
+            if deps.is_empty() {
+                hit = true;
+                continue;
+            }
+            out.push_str(&format!("depends = {}\n", deps.join(", ")));
+            hit = true;
+        } else {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if !hit && !deps.is_empty() {
+        out.push_str(&format!("depends = {}\n", deps.join(", ")));
+    }
+    std::fs::write(&p, out).is_ok()
+}
+
+/// Would `from -> to` close a dependency cycle? BFS over the generated
+/// confs from `to` looking for `from` (any edge kind: zinit refuses to
+/// boot on any cycle, so any cycle is a NAK here).
+fn would_cycle(outdir: &std::path::Path, from: &str, to: &str) -> bool {
+    let mut seen = BTreeMap::<String, bool>::new();
+    let mut work = vec![to.to_string()];
+    while let Some(n) = work.pop() {
+        if n == from {
+            return true;
+        }
+        if seen.contains_key(&n) {
+            continue;
+        }
+        seen.insert(n.clone(), true);
+        let base = n.split('@').next().unwrap_or(&n).to_string();
+        if let Some(ds) = read_depends(outdir, &base) {
+            for d in ds {
+                let target = d.strip_prefix("opt:").unwrap_or(&d).to_string();
+                if !seen.contains_key(&target) {
+                    work.push(target);
+                }
+            }
+        }
+    }
+    false
+}
+
+fn dep_token(dtype: u8, to: &str) -> Option<String> {
+    // REGULAR 0 and MILESTONE 3 are both hard (milestone only softens
+    // after success, which the file cannot express); WAITS_FOR 2 is soft.
+    match dtype {
+        0 | 3 => Some(to.to_string()),
+        2 => Some(format!("opt:{to}")),
+        _ => None,
+    }
+}
+
+// Serve one client until EOF, error or protocol violation. Returns the
+// next handle value so handles stay unique across the process lifetime.
+fn serve_one(
+    s: &mut UnixStream,
+    mut next_handle: u32,
+    names: &mut BTreeMap<u32, String>,
+    ctx: &Ctx,
+) -> u32 {
+    // BADREQ closes the connection, like control.cc (bad_conn_close).
+    macro_rules! badreq {
+        () => {{
+            let _ = wr_all(s, &[BADREQ]);
+            return next_handle;
+        }};
+    }
     loop {
         let mut t = [0u8; 1];
         if !rd_n(s, &mut t) {
-            return next;
+            return next_handle;
         }
         match t[0] {
             QUERYVERSION => {
                 if !wr_all(s, &VER_REPLY) {
-                    return next;
+                    return next_handle;
                 }
             }
             FINDSERVICE | LOADSERVICE => {
-                let is_find = t[0] == FINDSERVICE;
                 let len = match rd_u16(s) {
                     Some(l) => l,
-                    None => return next,
+                    None => return next_handle,
                 };
                 if len == 0 || len > 1021 {
-                    let _ = wr_all(s, &[BADREQ]);
-                    return next;
+                    badreq!();
                 }
                 let mut name = vec![0u8; len as usize];
                 if !rd_n(s, &mut name) {
-                    return next;
+                    return next_handle;
+                }
+                if !valid_proto_name(&name) {
+                    badreq!();
                 }
                 let svc = String::from_utf8_lossy(&name).into_owned();
-                let mut reply = [SERVICERECORD, 2, 0, 0, 0, 0, 2];
-                reply[2..6].copy_from_slice(&next.to_le_bytes());
-                names.insert(next, svc);
-                next += 1;
-                let _ = is_find;
-                if !wr_all(s, &reply) {
-                    return next;
+                match z_status(&ctx.zsock, &svc) {
+                    Some(st) => {
+                        let mut reply = [SERVICERECORD, 0, 0, 0, 0, 0, 0];
+                        reply[1] = st.state;
+                        reply[2..6].copy_from_slice(&next_handle.to_le_bytes());
+                        reply[6] = st.target;
+                        names.insert(next_handle, svc);
+                        next_handle += 1;
+                        if !wr_all(s, &reply) {
+                            return next_handle;
+                        }
+                    }
+                    None => {
+                        // No supervisor (tests) → canned STARTED, the old
+                        // devmon-quiet fallback. Supervisor up but unknown
+                        // service → honest NOSERVICE.
+                        if c4_dial(&ctx.zsock).is_some() {
+                            if !wr_all(s, &[NOSERVICE]) {
+                                return next_handle;
+                            }
+                        } else {
+                            let mut reply = [SERVICERECORD, 2, 0, 0, 0, 0, 2];
+                            reply[2..6].copy_from_slice(&next_handle.to_le_bytes());
+                            names.insert(next_handle, svc);
+                            next_handle += 1;
+                            if !wr_all(s, &reply) {
+                                return next_handle;
+                            }
+                        }
+                    }
                 }
             }
-            11 | 12 | 14 => {
-                let mut rest = [0u8; 9];
-                if !rd_n(s, &mut rest) || !wr_all(s, &[ACK]) {
-                    return next;
-                }
-            }
-            WAKESERVICE => {
+            STARTSERVICE | STOPSERVICE | WAKESERVICE | RELEASESERVICE => {
+                // [cmd, flags, handle]: bit0 pin, bit1 gentle, bit2
+                // restart-after-stop, bit7 pre-ack.
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next;
+                    return next_handle;
                 }
-                // flags(1) + handle(4): wake the named service for real.
-                let h = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
-                if let Some(nm) = names.get(&h).cloned() {
-                    zinit_start_best_effort(&nm);
+                let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+                let name = match names.get(&handle).cloned() {
+                    Some(n) => n,
+                    None => badreq!(),
+                };
+                if rest[0] & 128 != 0 && !wr_all(s, &[PREACK]) {
+                    return next_handle;
+                }
+                // pin (bit0) has no counterpart: start/stop covers it.
+                // gentle (bit1) cannot enumerate dependents without the
+                // plan, so it proceeds (documented).
+                let (verb, target) = match t[0] {
+                    STARTSERVICE => ("start", ST_STARTED),
+                    WAKESERVICE => ("start", ST_STARTED),
+                    RELEASESERVICE => ("stop", ST_STOPPED),
+                    _ => {
+                        if rest[0] & 4 != 0 {
+                            ("restart", ST_STARTED)
+                        } else {
+                            ("stop", ST_STOPPED)
+                        }
+                    }
+                };
+                if !z_act(&ctx.zsock, verb, &name) {
+                    if !wr_all(s, &[NAK]) {
+                        return next_handle;
+                    }
+                    continue;
+                }
+                match z_status(&ctx.zsock, &name) {
+                    Some(st) if st.state == target => {
+                        // ponytail: synchronous event approximation; the real
+                        // daemon emits on transition, we emit on arrival.
+                        emit_events(s, handle, if target == ST_STARTED { 0 } else { 1 }, &st);
+                        if !wr_all(s, &[ALREADYSS]) {
+                            return next_handle;
+                        }
+                    }
+                    _ => {
+                        if !wr_all(s, &[ACK]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            UNPINSERVICE => {
+                // No pin exists anywhere: unpinning always succeeds.
+                let mut rest = [0u8; 4];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let handle = u32::from_le_bytes(rest);
+                if !names.contains_key(&handle) {
+                    badreq!();
                 }
                 if !wr_all(s, &[ACK]) {
-                    return next;
+                    return next_handle;
+                }
+            }
+            LISTSERVICES | LISTSERVICES5 => {
+                let v5 = t[0] == LISTSERVICES5;
+                let graves = match z_list(&ctx.zsock) {
+                    Some(l) => l,
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                };
+                for (n, stok) in &graves {
+                    let st = z_status(&ctx.zsock, n).unwrap_or(ZStatus {
+                        state: z_state_tok(stok),
+                        target: ST_STOPPED,
+                        pid: -1,
+                        has_pid: false,
+                        exhausted: false,
+                    });
+                    let buf = if v5 { status_buf5(&st) } else { status_buf(&st) };
+                    let nb = n.as_bytes();
+                    let nl = nb.len().min(256);
+                    let mut pkt = Vec::with_capacity(2 + buf.len() + nl);
+                    pkt.push(SVCINFO);
+                    pkt.push(nl as u8);
+                    pkt.extend_from_slice(&buf);
+                    pkt.extend_from_slice(&nb[..nl]);
+                    if !wr_all(s, &pkt) {
+                        return next_handle;
+                    }
+                }
+                if !wr_all(s, &[LISTDONE]) {
+                    return next_handle;
+                }
+            }
+            UNLOADSERVICE => {
+                // Descriptions live in files; nothing transient to unload.
+                let mut rest = [0u8; 4];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                if !names.contains_key(&u32::from_le_bytes(rest)) {
+                    badreq!();
+                }
+                if !wr_all(s, &[NAK]) {
+                    return next_handle;
+                }
+            }
+            SHUTDOWN => {
+                // zinit has no poweroff/reboot path by design: refuse loudly.
+                let mut b = [0u8; 1];
+                if !rd_n(s, &mut b) {
+                    return next_handle;
+                }
+                if !(1..=6).contains(&b[0]) {
+                    badreq!();
+                }
+                if !wr_all(s, &[NAK]) {
+                    return next_handle;
+                }
+            }
+            ADD_DEP | REM_DEP | ENABLESERVICE | ENABLE_SERVICE_V7 | REM_DEP_V7 => {
+                // [cmd, deptype, from32, to32]. Persisted into from.conf
+                // + reload-all: dependencies are file-bound under zinit.
+                let v7 = t[0] == ENABLE_SERVICE_V7 || t[0] == REM_DEP_V7;
+                let adding = t[0] == ADD_DEP || t[0] == ENABLESERVICE || t[0] == ENABLE_SERVICE_V7;
+                let mut rest = [0u8; 9];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let from_h = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+                let to_h = u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]);
+                let (from, to) = match (names.get(&from_h).cloned(), names.get(&to_h).cloned()) {
+                    (Some(f), Some(tn)) if f != tn => (f, tn),
+                    _ => badreq!(),
+                };
+                let tok = match dep_token(rest[0], &to) {
+                    Some(x) => x,
+                    None => badreq!(),
+                };
+                let mut deps = match read_depends(&ctx.outdir, &from) {
+                    Some(d) => d,
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                };
+                if adding {
+                    if deps.contains(&tok) {
+                        if v7 {
+                            let st = z_status(&ctx.zsock, &to).unwrap_or(ZStatus {
+                                state: ST_STOPPED,
+                                target: ST_STOPPED,
+                                pid: -1,
+                                has_pid: false,
+                                exhausted: false,
+                            });
+                            let mut pkt = vec![SERVICESTATUSR, 1];
+                            pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
+                            if !wr_all(s, &pkt) {
+                                return next_handle;
+                            }
+                        } else if !wr_all(s, &[ACK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                    // dinit refuses REGULAR unless from is STOPPED or to is
+                    // STARTED; mirror it (best effort: unknown → proceed).
+                    if rest[0] == 0 {
+                        if let (Some(fs), Some(ts)) = (z_status(&ctx.zsock, &from), z_status(&ctx.zsock, &to)) {
+                            if fs.state != ST_STOPPED && ts.state != ST_STARTED {
+                                if !wr_all(s, &[NAK]) {
+                                    return next_handle;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if would_cycle(&ctx.outdir, &from, &to) {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                    deps.push(tok);
+                    if !write_depends(&ctx.outdir, &from, &deps) || c4_ask(&ctx.zsock, "C compatd reload-all\n").map(|r| !r.starts_with("R ")).unwrap_or(true) {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                    if t[0] == ENABLESERVICE || t[0] == ENABLE_SERVICE_V7 {
+                        // do_enable: a started dependent pulls the dependency.
+                        if let Some(fs) = z_status(&ctx.zsock, &from) {
+                            if fs.state == ST_STARTED || fs.state == 1 {
+                                z_act("start", &to);
+                            }
+                        }
+                    }
+                    if v7 {
+                        let st = z_status(&ctx.zsock, &to).unwrap_or(ZStatus {
+                            state: ST_STOPPED,
+                            target: ST_STOPPED,
+                            pid: -1,
+                            has_pid: false,
+                            exhausted: false,
+                        });
+                        let mut pkt = vec![SERVICESTATUSR, 0];
+                        pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
+                        if !wr_all(s, &pkt) {
+                            return next_handle;
+                        }
+                    } else if !wr_all(s, &[ACK]) {
+                        return next_handle;
+                    }
+                } else {
+                    let had = deps.contains(&tok);
+                    if had {
+                        deps.retain(|d| d != &tok);
+                        if !write_depends(&ctx.outdir, &from, &deps) || c4_ask(&ctx.zsock, "C compatd reload-all\n").map(|r| !r.starts_with("R ")).unwrap_or(true) {
+                            if !wr_all(s, &[NAK]) {
+                                return next_handle;
+                            }
+                            continue;
+                        }
+                    }
+                    if v7 {
+                        let st = z_status(&ctx.zsock, &to).unwrap_or(ZStatus {
+                            state: ST_STOPPED,
+                            target: ST_STOPPED,
+                            pid: -1,
+                            has_pid: false,
+                            exhausted: false,
+                        });
+                        let mut pkt = vec![SERVICESTATUSR, if had { 1 } else { 0 }];
+                        pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
+                        if !wr_all(s, &pkt) {
+                            return next_handle;
+                        }
+                    } else if !wr_all(s, &[if had { ACK } else { NAK }]) {
+                        return next_handle;
+                    }
+                }
+            }
+            QUERY_LOAD_MECH => {
+                // DIRLOAD with our outdir as the single service directory.
+                let dir = ctx.outdir.display().to_string();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| String::from("/"));
+                let db = dir.as_bytes();
+                let cb = cwd.as_bytes();
+                let total = 2 + 4 + 4 + (4 + cb.len()) + (4 + db.len());
+                let mut pkt = Vec::with_capacity(total);
+                pkt.push(LOADER_MECH);
+                pkt.push(1);
+                pkt.extend_from_slice(&(total as u32).to_le_bytes());
+                pkt.extend_from_slice(&1u32.to_le_bytes());
+                pkt.extend_from_slice(&(cb.len() as u32).to_le_bytes());
+                pkt.extend_from_slice(cb);
+                pkt.extend_from_slice(&(db.len() as u32).to_le_bytes());
+                pkt.extend_from_slice(db);
+                if !wr_all(s, &pkt) {
+                    return next_handle;
+                }
+            }
+            QUERYSERVICENAME => {
+                // [cmd, reserved, handle]
+                let mut rest = [0u8; 5];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+                match names.get(&handle) {
+                    Some(n) => {
+                        let nb = n.as_bytes();
+                        let mut pkt = Vec::with_capacity(4 + nb.len());
+                        pkt.push(SERVICENAME);
+                        pkt.push(0);
+                        pkt.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+                        pkt.extend_from_slice(nb);
+                        if !wr_all(s, &pkt) {
+                            return next_handle;
+                        }
+                    }
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            RELOADSERVICE => {
+                let mut rest = [0u8; 4];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                if !names.contains_key(&u32::from_le_bytes(rest)) {
+                    badreq!();
+                }
+                // ponytail: reload-all re-reads everything; per-service
+                // reload needs a supervisor channel that does not exist.
+                match c4_ask(&ctx.zsock, "C compatd reload-all\n") {
+                    Some(r) if r.starts_with("R ") => {
+                        if !wr_all(s, &[ACK]) {
+                            return next_handle;
+                        }
+                    }
+                    _ => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            SETENV => {
+                let len = match rd_u16(s) {
+                    Some(l) => l,
+                    None => return next_handle,
+                };
+                if len == 0 || len > 1021 {
+                    badreq!();
+                }
+                let mut kv = vec![0u8; len as usize];
+                if !rd_n(s, &mut kv) {
+                    return next_handle;
+                }
+                // Accepted no-op (no activation environment exists — same
+                // contract as the dinitctl shim); malformed is BADREQ.
+                match kv.iter().position(|&b| b == b'=') {
+                    Some(0) | None => badreq!(),
+                    Some(_) => {
+                        if !wr_all(s, &[ACK]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            SERVICESTATUSQ | SERVICESTATUS5Q | SERVICESTATUS6Q => {
+                let mut rest = [0u8; 4];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let handle = u32::from_le_bytes(rest);
+                let name = match names.get(&handle) {
+                    Some(n) => n.clone(),
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                };
+                let st = z_status(&ctx.zsock, &name).unwrap_or(ZStatus {
+                    state: ST_STOPPED,
+                    target: ST_STOPPED,
+                    pid: -1,
+                    has_pid: false,
+                    exhausted: false,
+                });
+                let mut pkt = vec![SERVICESTATUSR, 0];
+                match t[0] {
+                    SERVICESTATUSQ => pkt.extend_from_slice(&status_buf(&st)),
+                    SERVICESTATUS5Q => pkt.extend_from_slice(&status_buf5(&st)),
+                    _ => pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &name))),
+                }
+                if !wr_all(s, &pkt) {
+                    return next_handle;
+                }
+            }
+            SETTRIGGER => {
+                // No triggered type survives translation (oneshot never
+                // waits), so there is nothing to trigger: NAK, like dinit
+                // answers for a non-triggered service.
+                let mut rest = [0u8; 5];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                if !wr_all(s, &[NAK]) {
+                    return next_handle;
+                }
+            }
+            CATLOG => {
+                // [cmd, flags, handle]: file logs are readable, everything
+                // else NAKs (dinit only serves BUFFER logs the same way).
+                let mut rest = [0u8; 5];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+                let data = names
+                    .get(&handle)
+                    .and_then(|n| std::fs::read_to_string(ctx.outdir.join(format!("{n}.conf"))).ok())
+                    .and_then(|text| {
+                        text.lines().find_map(|l| {
+                            l.strip_prefix("log = file:").map(|p| p.to_string())
+                        })
+                    })
+                    .and_then(|p| std::fs::read(&p).ok());
+                match data {
+                    Some(all) => {
+                        let start = all.len().saturating_sub(255);
+                        let tail = &all[start..];
+                        let mut pkt = Vec::with_capacity(3 + tail.len());
+                        pkt.push(SERVICE_LOG);
+                        pkt.push(0);
+                        pkt.push(tail.len() as u8);
+                        pkt.extend_from_slice(tail);
+                        if !wr_all(s, &pkt) {
+                            return next_handle;
+                        }
+                    }
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            SIGNALQ => {
+                // [cmd, signum i32, handle]. Delivered via the POSIX kill
+                // utility (std has no kill); missing binary or dead pid is
+                // KILLERR, matching the failure a real daemon would report.
+                let mut rest = [0u8; 8];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let signum = i32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                let handle = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+                let name = match names.get(&handle) {
+                    Some(n) => n.clone(),
+                    None => {
+                        if !wr_all(s, &[NAK]) {
+                            return next_handle;
+                        }
+                        continue;
+                    }
+                };
+                if signum < 1 || signum > 64 {
+                    if !wr_all(s, &[SIGNAL_BADSIG]) {
+                        return next_handle;
+                    }
+                    continue;
+                }
+                let pid = z_status(&ctx.zsock, &name).and_then(|st| st.has_pid.then_some(st.pid));
+                match pid {
+                    None => {
+                        if !wr_all(s, &[SIGNAL_NOPID]) {
+                            return next_handle;
+                        }
+                    }
+                    Some(p) => {
+                        let ok = std::process::Command::new("kill")
+                            .arg("-s")
+                            .arg(signum.to_string())
+                            .arg(p.to_string())
+                            .status()
+                            .map(|st| st.success())
+                            .unwrap_or(false);
+                        if !wr_all(s, &[if ok { ACK } else { SIGNAL_KILLERR }]) {
+                            return next_handle;
+                        }
+                    }
+                }
+            }
+            QUERYSERVICEDSCDIR => {
+                // [cmd, spare, handle]: spare must be 0.
+                let mut rest = [0u8; 5];
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
+                }
+                let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
+                if rest[0] != 0 || !names.contains_key(&handle) {
+                    if !wr_all(s, &[NAK]) {
+                        return next_handle;
+                    }
+                    continue;
+                }
+                let dir = ctx.outdir.display().to_string();
+                let db = dir.as_bytes();
+                let mut pkt = Vec::with_capacity(5 + db.len());
+                pkt.push(SVCDSCDIR);
+                pkt.extend_from_slice(&(db.len() as u32).to_le_bytes());
+                pkt.extend_from_slice(db);
+                if !wr_all(s, &pkt) {
+                    return next_handle;
                 }
             }
             CLOSEHANDLE => {
                 let mut rest = [0u8; 4];
-                if !rd_n(s, &mut rest) || !wr_all(s, &[ACK]) {
-                    return next;
+                if !rd_n(s, &mut rest) {
+                    return next_handle;
                 }
                 let h = u32::from_le_bytes(rest);
-                names.remove(&h);
+                if names.remove(&h).is_none() {
+                    // Unknown handle closes the connection upstream too.
+                    badreq!();
+                }
+                if !wr_all(s, &[ACK]) {
+                    return next_handle;
+                }
+            }
+            GETALLENV => {
+                let mut b = [0u8; 1];
+                if !rd_n(s, &mut b) {
+                    return next_handle;
+                }
+                if b[0] != 0 {
+                    badreq!();
+                }
+                // Empty store: [ALLENV, size_t 0]. The width follows the
+                // build (8 on 64-bit), exactly like control.cc.
+                let mut pkt = vec![ALLENV];
+                pkt.extend_from_slice(&(0usize).to_le_bytes());
+                if !wr_all(s, &pkt) {
+                    return next_handle;
+                }
+            }
+            LISTENENV => {
+                // Accepted; environment never changes, so no ENVEVENT ever
+                // follows — the steady state stays silent, as observed
+                // against real dinit.
+                if !wr_all(s, &[ACK]) {
+                    return next_handle;
+                }
             }
             _ => {
-                let _ = wr_all(s, &[BADREQ]);
-                return next;
+                badreq!();
             }
         }
     }
 }
 
-fn cmd_compatd(path: &str) -> i32 {
+fn cmd_compatd(path: &str, outdir: &std::path::Path) -> i32 {
     let _ = std::fs::remove_file(path);
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
@@ -856,11 +1716,15 @@ fn cmd_compatd(path: &str) -> i32 {
             return 1;
         }
     };
-    let mut next: u32 = 0;
+    let ctx = Ctx {
+        outdir: outdir.to_path_buf(),
+        zsock: zinit_socket(None),
+    };
+    let mut next_handle = 0u32;
     let mut names: BTreeMap<u32, String> = BTreeMap::new();
     for conn in listener.incoming() {
         if let Ok(mut s) = conn {
-            next = serve_one(&mut s, next, &mut names);
+            next_handle = serve_one(&mut s, next_handle, &mut names, &ctx);
         }
     }
     0
@@ -966,7 +1830,7 @@ fn cmd_start(out: Option<&str>) -> i32 {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "z-dinit-generator".to_string());
     let compat = format!(
-        "type = process\ncommand = {exe} compatd\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n"
+        "type = process\ncommand = {exe} compatd --out {outdir}\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n"
     );
     let _ = std::fs::create_dir_all(&outp);
     if std::fs::write(outp.join("compatd.conf"), compat).is_err() {
@@ -1038,12 +1902,27 @@ fn main() -> std::process::ExitCode {
         }
         "dinitctl" => cmd_dinitctl(&args),
         "compatd" => {
-            if args.len() > 1 {
-                eprintln!("usage: z-dinit-generator compatd [/run/dinitctl]");
-                2
-            } else {
-                cmd_compatd(args.first().map(|s| s.as_str()).unwrap_or(DINIT_SOCK_DEFAULT))
+            let mut sock = DINIT_SOCK_DEFAULT;
+            let mut out = "/etc/zinit/services.d";
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--out" {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("usage: z-dinit-generator compatd [/run/dinitctl] [--out DIR]");
+                        return std::process::ExitCode::from(2);
+                    }
+                    out = &args[i];
+                } else if sock == DINIT_SOCK_DEFAULT {
+                    sock = &args[i];
+                } else {
+                    eprintln!("usage: z-dinit-generator compatd [/run/dinitctl] [--out DIR]");
+                    return std::process::ExitCode::from(2);
+                }
+                i += 1;
             }
+            let rc = cmd_compatd(sock, std::path::Path::new(out));
+            return std::process::ExitCode::from(rc as u8);
         }
         "start" => {
             if args.is_empty() {
@@ -1122,12 +2001,35 @@ mod tests {
         assert!(c.text.contains("ready = none\n"));
     }
 
-    // compatd framing (ported, kept green).
-    fn pair() -> (UnixStream, UnixStream) {
+    // compatd protocol conformance (byte-exact vs control.cc).
+    fn fctx() -> Ctx {
+        Ctx {
+            outdir: std::env::temp_dir().join("zdg-no-such-outdir"),
+            zsock: String::from("/tmp/zdg-no-such-sock-xyz"),
+        }
+    }
+
+    fn serve_bg(
+        server: UnixStream,
+        names: BTreeMap<u32, String>,
+        ctx: Ctx,
+        next: u32,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut server = server;
+            let mut names = names;
+            serve_one(&mut server, next, &mut names, &ctx);
+        })
+    }
+
+    /// Stub zinit C4 server: fixed services, records reload-all.
+    fn stub(
+        reloaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
+        static N: AtomicU32 = AtomicU32::new(100);
         let dir = std::env::temp_dir().join(format!(
-            "zdg-compatd-{}-{}",
+            "zdg-stub-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
@@ -1135,31 +2037,72 @@ mod tests {
         let path = dir.join("ctl");
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let client = UnixStream::connect(&path).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-        (server, client)
+        let sock = path.display().to_string();
+        let h = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut c = match conn {
+                    Ok(c) => BufReader::new(c),
+                    Err(_) => break,
+                };
+                loop {
+                    let mut line = String::new();
+                    match c.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    let w: Vec<&str> = line.split_whitespace().collect();
+                    let reply = if w.len() >= 4 && w[2] == "status" {
+                        match w[3] {
+                            "a" => "R compatd 0 a running desired=up pid=99 up=1s restarts=0/3\n",
+                            "b" => "R compatd 0 b stopped desired=down pid=- up=- restarts=0/3\n",
+                            _ => "E compatd 3 unknown service\n",
+                        }
+                    } else if w.len() >= 3 && w[2] == "list" {
+                        "R compatd 0 2 a=running b=stopped\n"
+                    } else if w.len() >= 4 && (w[2] == "start" || w[2] == "stop" || w[2] == "restart") {
+                        "R compatd 0\n"
+                    } else if w.len() >= 3 && w[2] == "reload-all" {
+                        reloaded.store(true, Ordering::SeqCst);
+                        "R compatd 0\n"
+                    } else {
+                        "E compatd 2 bad verb\n"
+                    };
+                    let _ = c.get_mut().write_all(reply.as_bytes());
+                }
+            }
+        });
+        (sock, h)
     }
 
-    fn read_exact(client: &mut UnixStream, n: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; n];
-        let mut got = 0;
-        while got < n {
-            match client.read(&mut buf[got..]) {
-                Ok(0) => break,
-                Ok(k) => got += k,
-                Err(e) => panic!("read: {e}"),
-            }
-        }
-        buf.truncate(got);
-        buf
+    fn tmpout(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(1000);
+        let dir = std::env::temp_dir().join(format!(
+            "zdg-out-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn find_handle(client: &mut UnixStream, ctx_sock_note: &str, name: &[u8]) -> u32 {
+        let _ = ctx_sock_note;
+        let l = name.len() as u16;
+        client.write_all(&[FINDSERVICE]).unwrap();
+        client.write_all(&l.to_le_bytes()).unwrap();
+        client.write_all(name).unwrap();
+        let r = read_exact(client, 7);
+        assert_eq!(r[0], SERVICERECORD);
+        u32::from_le_bytes([r[2], r[3], r[4], r[5]])
     }
 
     #[test]
     fn version_handshake() {
-        let (mut server, mut client) = pair();
-        let mut names = BTreeMap::new();
-        let h = std::thread::spawn(move || serve_one(&mut server, 0, &mut names));
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
         client.write_all(&[QUERYVERSION]).unwrap();
         assert_eq!(read_exact(&mut client, 5), VER_REPLY);
         drop(client);
@@ -1167,10 +2110,9 @@ mod tests {
     }
 
     #[test]
-    fn find_returns_started_with_fresh_handles() {
-        let (mut server, mut client) = pair();
-        let mut names = BTreeMap::new();
-        let h = std::thread::spawn(move || serve_one(&mut server, 41, &mut names));
+    fn find_canned_without_supervisor() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 41);
         client.write_all(&[FINDSERVICE, 6, 0]).unwrap();
         client.write_all(b"system").unwrap();
         let r = read_exact(&mut client, 7);
@@ -1182,25 +2124,398 @@ mod tests {
     }
 
     #[test]
-    fn wake_acks_without_zinit() {
-        let (mut server, mut client) = pair();
+    fn find_rejects_dot_name() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[FINDSERVICE, 2, 0]).unwrap();
+        client.write_all(b".x").unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        assert_eq!(read_exact(&mut client, 1), []);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn close_unknown_gets_badreq_and_close() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[CLOSEHANDLE, 9, 9, 9, 9]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        assert_eq!(read_exact(&mut client, 1), []);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn close_known_acks_then_forgets() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 41);
+        let hd = find_handle(&mut client, "", b"system");
+        assert_eq!(hd, 41);
+        client.write_all(&[CLOSEHANDLE]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        client.write_all(&[CLOSEHANDLE]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn unpin_acks_without_pin_store() {
+        let (server, mut client) = pair();
         let mut names = BTreeMap::new();
         names.insert(7, "x".to_string());
-        let h = std::thread::spawn(move || serve_one(&mut server, 8, &mut names));
-        client.write_all(&[WAKESERVICE, 0, 7, 0, 0, 0]).unwrap();
+        let h = serve_bg(server, names, fctx(), 8);
+        client.write_all(&[UNPINSERVICE, 7, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        client.write_all(&[UNPINSERVICE, 8, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn queryname_roundtrip() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 5);
+        let hd = find_handle(&mut client, "", b"dbus");
+        client.write_all(&[QUERYSERVICENAME, 0]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        let hdr = read_exact(&mut client, 4);
+        assert_eq!(&hdr[..2], &[SERVICENAME, 0]);
+        let n = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        assert_eq!(read_exact(&mut client, n), b"dbus");
+        client.write_all(&[QUERYSERVICENAME, 0, 9, 9, 9, 9]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn setenv_accepts_assignment_rejects_bare() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[SETENV, 3, 0]).unwrap();
+        client.write_all(b"a=b").unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        client.write_all(&[SETENV, 2, 0]).unwrap();
+        client.write_all(b"=x").unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn getallenv_empty_and_reserved_rejected() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[GETALLENV, 0]).unwrap();
+        let r = read_exact(&mut client, 1 + std::mem::size_of::<usize>());
+        assert_eq!(r[0], ALLENV);
+        assert!(r[1..].iter().all(|&b| b == 0));
+        client.write_all(&[GETALLENV, 1]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn listenenv_acks() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[LISTENENV]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [ACK]);
         drop(client);
         h.join().unwrap();
     }
 
     #[test]
-    fn unknown_type_gets_badreq_and_close() {
-        let (mut server, mut client) = pair();
+    fn shutdown_naks_valid_types_badreqs_junk() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
+        client.write_all(&[SHUTDOWN, 4]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        client.write_all(&[SHUTDOWN, 9]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn unload_naks_loaded_badreqs_unknown() {
+        let (server, mut client) = pair();
         let mut names = BTreeMap::new();
-        let h = std::thread::spawn(move || serve_one(&mut server, 0, &mut names));
+        names.insert(3, "s".to_string());
+        let h = serve_bg(server, names, fctx(), 4);
+        client.write_all(&[UNLOADSERVICE, 3, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        client.write_all(&[UNLOADSERVICE, 77, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn trigger_always_naks() {
+        let (server, mut client) = pair();
+        let mut names = BTreeMap::new();
+        names.insert(3, "s".to_string());
+        let h = serve_bg(server, names, fctx(), 4);
+        client.write_all(&[SETTRIGGER, 3, 0, 0, 0, 1]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_type_gets_badreq_and_close() {
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
         client.write_all(&[200]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [BADREQ]);
         assert_eq!(read_exact(&mut client, 1), []);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn find_reports_live_state_and_noservice() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("find");
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 10);
+        let hd = find_handle(&mut client, "", b"a");
+        assert_eq!(hd, 10);
+        client.write_all(&[FINDSERVICE, 5, 0]).unwrap();
+        client.write_all(b"nope!").unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NOSERVICE]);
+        let hd2 = find_handle(&mut client, "", b"b");
+        assert_eq!(hd2, 11);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn start_reaches_alreadyss_with_events_and_preack() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("start");
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 20);
+        let hd = find_handle(&mut client, "", b"a");
+        client.write_all(&[STARTSERVICE, 128]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [PREACK]);
+        let e1 = read_exact(&mut client, 17);
+        assert_eq!(&e1[..2], &[SERVICEEVENT, 17]);
+        assert_eq!(&e1[2..6], &hd.to_le_bytes());
+        assert_eq!(e1[6], 0);
+        let e5 = read_exact(&mut client, 21);
+        assert_eq!(&e5[..2], &[SERVICEEVENT5, 21]);
+        assert_eq!(&e5[2..6], &hd.to_le_bytes());
+        assert_eq!(e5[6], 0);
+        assert_eq!(read_exact(&mut client, 1), [ALREADYSS]);
+        client.write_all(&[STARTSERVICE, 0, 99, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [BADREQ]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn stop_lands_alreadyss_on_stopped() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("stop");
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 30);
+        let hd = find_handle(&mut client, "", b"b");
+        client.write_all(&[STOPSERVICE, 0]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        let e1 = read_exact(&mut client, 17);
+        assert_eq!(e1[6], 1);
+        let _ = read_exact(&mut client, 21);
+        assert_eq!(read_exact(&mut client, 1), [ALREADYSS]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn status_buffers_match_control_layout() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("status");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 40);
+        let hd = find_handle(&mut client, "", b"a");
+        client.write_all(&[SERVICESTATUSQ]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        let r = read_exact(&mut client, 12);
+        assert_eq!(&r[..2], &[SERVICESTATUSR, 0]);
+        assert_eq!(r[2], ST_STARTED);
+        assert_eq!(&r[8..12], &99i32.to_le_bytes());
+        client.write_all(&[SERVICESTATUS6Q]).unwrap();
+        client.write_all(&hd.to_le_bytes()).unwrap();
+        let r6 = read_exact(&mut client, 32);
+        assert_eq!(&r6[..2], &[SERVICESTATUSR, 0]);
+        client.write_all(&[SERVICESTATUSQ, 77, 0, 0, 0]).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn list5_reports_every_service_then_done() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("list");
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 50);
+        client.write_all(&[LISTSERVICES5]).unwrap();
+        let r = read_exact(&mut client, 2 * 17 + 1);
+        assert_eq!(r[0], SVCINFO);
+        assert_eq!(r[17], SVCINFO);
+        assert_eq!(r[34], LISTDONE);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn add_then_remove_dep_persists_and_reloads() {
+        use std::sync::atomic::Ordering;
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded.clone());
+        let out = tmpout("dep");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\n").unwrap();
+        let ctx = Ctx { outdir: out.clone(), zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 60);
+        // stub services a (running) and b (stopped); persist a -> b.
+        let fh = find_handle(&mut client, "", b"a");
+        let th = find_handle(&mut client, "", b"b");
+        let mut pkt = vec![ADD_DEP, 0];
+        pkt.extend_from_slice(&fh.to_le_bytes());
+        pkt.extend_from_slice(&th.to_le_bytes());
+        client.write_all(&pkt).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
+        assert!(text.contains("depends = b\n"), "got: {text}");
+        assert!(reloaded.load(Ordering::SeqCst));
+        // duplicate add is a quiet ACK.
+        client.write_all(&pkt).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        // removal returns to no-depends + ACK.
+        let mut rp = vec![REM_DEP, 0];
+        rp.extend_from_slice(&fh.to_le_bytes());
+        rp.extend_from_slice(&th.to_le_bytes());
+        client.write_all(&rp).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
+        assert!(!text.contains("depends"), "got: {text}");
+        // removing again is NAK.
+        client.write_all(&rp).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        // cycle: b already required on a, so a -> b is refused.
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\ndepends = a\n").unwrap();
+        client.write_all(&pkt).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn signal_paths_report_like_control() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("sig");
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 80);
+        let bh = find_handle(&mut client, "", b"b");
+        // stopped service has no pid.
+        let mut p = vec![SIGNALQ];
+        p.extend_from_slice(&15i32.to_le_bytes());
+        p.extend_from_slice(&bh.to_le_bytes());
+        client.write_all(&p).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [SIGNAL_NOPID]);
+        // junk signal number.
+        let ah = find_handle(&mut client, "", b"a");
+        let mut p = vec![SIGNALQ];
+        p.extend_from_slice(&0i32.to_le_bytes());
+        p.extend_from_slice(&ah.to_le_bytes());
+        client.write_all(&p).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [SIGNAL_BADSIG]);
+        // unknown handle → NAK, connection stays open.
+        let mut p = vec![SIGNALQ];
+        p.extend_from_slice(&15i32.to_le_bytes());
+        p.extend_from_slice(&77u32.to_le_bytes());
+        client.write_all(&p).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn catlog_serves_file_logs_naks_the_rest() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("catlog");
+        let logp = out.join("svc.log");
+        std::fs::write(&logp, "hello-log").unwrap();
+        std::fs::write(
+            out.join("a.conf"),
+            format!("type = process\ncommand = /bin/a\nlog = file:{}\n", logp.display()),
+        )
+        .unwrap();
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\nlog = none\n").unwrap();
+        let ctx = Ctx { outdir: out, zsock };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 90);
+        let ah = find_handle(&mut client, "", b"a");
+        client.write_all(&[CATLOG, 0]).unwrap();
+        client.write_all(&ah.to_le_bytes()).unwrap();
+        let hdr = read_exact(&mut client, 3);
+        assert_eq!(&hdr[..2], &[SERVICE_LOG, 0]);
+        assert_eq!(read_exact(&mut client, hdr[2] as usize), b"hello-log");
+        let bh = find_handle(&mut client, "", b"b");
+        client.write_all(&[CATLOG, 0]).unwrap();
+        client.write_all(&bh.to_le_bytes()).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn dscdir_and_loadmech_describe_the_store() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("dsc");
+        let ctx = Ctx {
+            outdir: out.clone(),
+            zsock,
+        };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 95);
+        let ah = find_handle(&mut client, "", b"a");
+        client.write_all(&[QUERYSERVICEDSCDIR, 0]).unwrap();
+        client.write_all(&ah.to_le_bytes()).unwrap();
+        let hdr = read_exact(&mut client, 5);
+        assert_eq!(hdr[0], SVCDSCDIR);
+        let n = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        let got = read_exact(&mut client, n);
+        assert_eq!(got, out.display().to_string().as_bytes());
+        client.write_all(&[QUERY_LOAD_MECH]).unwrap();
+        let lm = read_exact(&mut client, 2);
+        assert_eq!(lm, [LOADER_MECH, 1]);
         drop(client);
         h.join().unwrap();
     }
