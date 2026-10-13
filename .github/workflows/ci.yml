@@ -136,6 +136,8 @@ jobs:
           printf 'type = process\ncommand = /bin/sleep 300\n' > kin/net
           printf 'type = internal\ndepends-on = svc\n' > kin/boot
           /tmp/zdg convert kin kout
+          echo CONVERT_OK
+          cat kout/svc.conf
           grep -q '^type = console$' kout/svc.conf
           grep -q 'command = /bin/srv %i' kout/svc.conf
           grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf
