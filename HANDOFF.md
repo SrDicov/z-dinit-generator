@@ -155,3 +155,43 @@ kill -9 sshd rearms (restarts=1/3), 16-min active soak, TERM to
 - Old `qtype.py`/`vsh.py` serial helpers superseded by direct
   socket python + ssh; `ser.sock` needs an early-connected logger
   or early boot output is lost (unix socket, no replay).
+
+## 2026-10-13 (later) — Void leg CLOSED (dinit reference + zinit PID 1)
+
+Recipe: kernel+initrd from `cage-void/boot/`, `-append
+"root=/dev/vda rw ip=dhcp rd.neednet=1 console=ttyS0,115200
+init=/usr/bin/dinit|/sbin/zinit-init"`, `-nographic < fifo` for
+interactive console (unix-socket serial backend went silent twice;
+FIFO never failed), ssh via `-hostfwd=tcp::2224-:22`.
+
+- dinit reference: `[OK] sshd/serial/boot`, `dinitctl list` =
+  boot+serial+sshd, sshd STARTED pid 586, ssh OK, 0 zombies.
+  Needed: `dracut-network` package + `rd.neednet=1` (dracut skips
+  net for local root otherwise), `40network` confirmed in image
+  (lsinitrd does NOT exist on this host — inspect via
+  `zcat | cpio -t`), sshd_config.d/empty.conf (root+empty).
+- zinit PID 1 (fresh glibc bins @714148f with the orphan fix):
+  `supervising 4`, probe PROBE_DONE, sshd/serial running, ssh OK.
+- Root cause (2nd of the day): Void's shipped sshd dinit file runs
+  the daemon **without `-D`** → classic double-fork: parent exits
+  0 instantly, untracked daemon holds :22, supervisor respawns
+  forever (`exited with status 0`, restarts=81). dinit tolerates
+  the same file (stable [OK] — restart-on-unexpected-only,
+  divergence-list candidate). Fixed at source (`-D`, one word),
+  re-converted, stable 4+ min restarts=0/3. GENERATOR NOTE: no
+  static detector for daemonizing commands exists; `-D` is a
+  seasoning rule for sshd-class services.
+- Orphan fix proven in production: kill -9 listener mid-session →
+  respawn tracked+running, **0 zombies** (old binary left 1).
+- compatd live-deployed (no rebuild: conf via ssh +
+  reload-all): `/sbin/zdg dinitctl list/status/is-started/stop/
+  start` all green over the real v7 socket. `kick` on a
+  budget-backing-off service answers "nothing to kick" (v0.0.2-era
+  semantics; kick only clears suppressed/completed).
+- Shutdown: TERM to `--sup` (NOT PID 1 — `--init` ignores power
+  signals by design) → full announce line on console, sshd down,
+  machine idle. The Alpine truncated-announce was a socket
+  artifact, not a product bug.
+- NEVER `pkill -f <pattern>`: killed its own wrapper and orphaned
+  a live qemu twice this session. Exact-PID kills + pre-kill
+  `cmdline` verification only.
