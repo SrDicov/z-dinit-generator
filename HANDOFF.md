@@ -195,3 +195,43 @@ FIFO never failed), ssh via `-hostfwd=tcp::2224-:22`.
 - NEVER `pkill -f <pattern>`: killed its own wrapper and orphaned
   a live qemu twice this session. Exact-PID kills + pre-kill
   `cmdline` verification only.
+
+## 2026-10-13 (later) — Chimera leg 90% (VM boots, needs ssh+shutdown proof)
+
+Recipe: kernel `cage-chimera/boot/vmlinuz-6.18.48-0-generic` + HAND-ROLLED
+`initramfs-chimera.img` (`./mkinitramfs-chimera.sh`: Chimera ships no
+dracut/mkinitfs and virtio_blk/ext4 are =m; ~30 files: musl sh+tools,
+kmod, module closure from modules.dep, /init that modprobes, waits for
+/dev/vda, switch_roots to `init=` from cmdline). Same `-nographic <
+qemu-in` FIFO console pattern as Void (unix-socket serial went silent
+twice; FIFO never failed). `-hostfwd=tcp::2225-:22`.
+
+- Gotchas baked into `mkinitramfs-chimera.sh`: musl loader must land on
+  the exact INTERP path (a stray `]` from readelf broke the first image
+  → kernel panic ENOENT); kmod needs the BINARY indexes (dep.bin et
+  al., not just text dep) or every lookup fails "not found"; /init
+  needs `export PATH` (only /bin is default) + step echos.
+- Seasoning: minimal dinit sources (serial via distro
+  `/usr/lib/agetty-service ttyS0` — Chimera uses nyagetty, installed
+  `nyagetty nyagetty-dinit`; sshd distro file already `-D`, added
+  `mkdir -p /run/sshd /var/chroot/ssh` — Chimera privsep dir is
+  non-standard; root unlocked; host keys via ssh-keygen -A after
+  mkdir /etc/ssh; empty-password sshd_config.d), convert clean,
+  `net` = REAL distro dhcpcd service (installed `dhcpcd
+  dhcpcd-dinit`; `before: network.target` warns+ignores correctly).
+- Convert policy found: services outside boot's dinit closure get
+  `enabled = no`, and EVERY convert run APPENDS it again (no
+  overwrite, no dedupe) — always `rm services.d/*.conf` before
+  re-converting, then re-apply seasoning. This explained the "v0.0.2
+  boot quirk" (net/probe never auto-started): my own stale files,
+  not a supervisor bug. GENERATOR BACKLOG: idempotent convert.
+- Status at pause: VM boots to `login:`, root console OK, `zctl
+  list` = boot/net/probe stopped + serial/sshd running,
+  PROBE_DONE at boot, sshd stable restarts=0/3. NOT yet proven:
+  ssh into 2225 (dhcpcd=running but no IP line captured),
+  verb battery, shutdown cascade. Musa note: Chimera runs frozen
+  v0.0.2 musl like Alpine (orphan fix pending musl release).
+- Deferred deliberately: full 61-service tree in VM (CI chimera-e2e
+  covers convert+container); early-env (needs dinitctl shim =
+  glibc, won't run on musl — same constraint as Alpine compatd)
+  and root-rw mounts belong to that full-tree effort.
