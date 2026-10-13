@@ -2431,22 +2431,29 @@ mod tests {
         let ctx = Ctx { outdir: out.clone(), zsock };
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), ctx, 60);
-        // stub services a (running) and b (stopped); persist a -> b.
+        // stub services a (running) and b (stopped); REGULAR add with
+        // from running and to stopped contradicts dinit rules → NAK.
         let fh = find_handle(&mut client, "", b"a");
         let th = find_handle(&mut client, "", b"b");
         let mut pkt = vec![ADD_DEP, 0];
         pkt.extend_from_slice(&fh.to_le_bytes());
         pkt.extend_from_slice(&th.to_le_bytes());
         client.write_all(&pkt).unwrap();
+        assert_eq!(read_exact(&mut client, 1), [NAK]);
+        // WAITS_FOR has no state rule: persists `opt:b` + reload-all.
+        let mut pkt = vec![ADD_DEP, 2];
+        pkt.extend_from_slice(&fh.to_le_bytes());
+        pkt.extend_from_slice(&th.to_le_bytes());
+        client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [ACK]);
         let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
-        assert!(text.contains("depends = b\n"), "got: {text}");
+        assert!(text.contains("depends = opt:b\n"), "got: {text}");
         assert!(reloaded.load(Ordering::SeqCst));
         // duplicate add is a quiet ACK.
         client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [ACK]);
         // removal returns to no-depends + ACK.
-        let mut rp = vec![REM_DEP, 0];
+        let mut rp = vec![REM_DEP, 2];
         rp.extend_from_slice(&fh.to_le_bytes());
         rp.extend_from_slice(&th.to_le_bytes());
         client.write_all(&rp).unwrap();
@@ -2456,8 +2463,8 @@ mod tests {
         // removing again is NAK.
         client.write_all(&rp).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
-        // cycle: b already required on a, so a -> b is refused.
-        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\ndepends = a\n").unwrap();
+        // cycle: b already soft-required on a, so a -> b is refused.
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\ndepends = opt:a\n").unwrap();
         client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
         drop(client);
