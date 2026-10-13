@@ -792,6 +792,9 @@ fn convert_one(
         // Raw shell text, quotes intact: the shell groups exactly like
         // dinit's own tokenizer did (verified: zero quoted commands in
         // the 63-service Chimera corpus, so this path is the exception).
+        if run_console {
+            w!("console lost: a quoted command runs as script, with no console");
+        }
         zt_owned = "script".to_string();
         if !stunt.is_empty() || !tail.is_empty() {
             command = format!("{stunt}{pre}{command}{tail}");
@@ -3330,7 +3333,7 @@ mod tests {
         let dir = tmpout("keys-in");
         std::fs::write(dir.join("vars.env"), "FOO=bar\n# c\nBADLINE\nEMPTY=\n").unwrap();
         std::fs::write(dir.join("inc"), "waits-for: other\n").unwrap();
-        let text = "type = process\ncommand = /bin/srv $1 --x=\"a  b\" # run it\ndepends-on = net\nrestart-limit-count = 5\nrestart-limit-interval = 20\nrestart-delay = 0.5\nsocket-listen = /run/s.sock\nrun-in-cgroup = /sys/fs/cgroup/sys\nrlimit-nofile = 1024:4096\nrlimit-core = 0\nlog-type = buffer\noptions: runs-on-console no-new-privs bogus-opt\nload-options: export-service-name\nenv-file = vars.env\n@include inc\n";
+        let text = "type = process\ncommand = /bin/srv $1 --x=A_B # run it\ndepends-on = net\nrestart-limit-count = 5\nrestart-limit-interval = 20\nrestart-delay = 0.5\nsocket-listen = /run/s.sock\nrun-in-cgroup = /sys/fs/cgroup/sys\nrlimit-nofile = 1024:4096\nrlimit-core = 0\nlog-type = buffer\noptions: runs-on-console no-new-privs bogus-opt\nload-options: export-service-name\nenv-file = vars.env\n@include inc\n";
         let mut pulls = BTreeMap::new();
         let mut befores = Vec::new();
         let mut warns = Vec::new();
@@ -3338,7 +3341,7 @@ mod tests {
             .expect("converts");
         assert!(c.text.contains("type = console\n"), "got:\n{}", c.text);
         assert!(c.text.contains("tty = /dev/console\n"), "got:\n{}", c.text);
-        assert!(c.text.contains("command = /bin/srv %i --x=a  b\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("command = /bin/srv %i --x=A_B\n"), "got:\n{}", c.text);
         assert!(c.text.contains("depends = net, opt:other\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-budget = 5 restarts per 20s\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-delay = 500ms\n"), "got:\n{}", c.text);
@@ -3388,6 +3391,20 @@ mod tests {
         )
         .expect("converts");
         assert!(c.text.contains("type = process\n"), "got:\n{}", c.text);
+        // quoted + console loses the console, loudly (only script parses).
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /bin/getty 'tty 1'\noptions: runs-on-console\n",
+            "g",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("type = script\n"), "got:\n{}", c.text);
+        assert!(!c.text.contains("tty = "), "got:\n{}", c.text);
+        assert!(warns.join("\n").contains("console lost"), "got: {warns:?}");
         // quoted oneshot warns loudly (no shell available there).
         let mut warns = Vec::new();
         let _ = convert_one(
