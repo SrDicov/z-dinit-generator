@@ -3365,6 +3365,8 @@ mod tests {
         assert_eq!(cook_value("a  b\tc"), "a b c");
         assert_eq!(cook_value("\"a  b\" c"), "a  b c");
         assert_eq!(cook_value("x \\y"), "x y");
+        // single quotes are literal upstream: kept, never grouping.
+        assert_eq!(cook_value("x 'a  b'"), "x 'a b'");
         assert_eq!(strip_comment("command = a # tail"), "command = a ");
         assert_eq!(strip_comment("command = \"a#b\""), "command = \"a#b\"");
         assert_eq!(strip_comment("# full"), "");
@@ -3411,7 +3413,7 @@ mod tests {
         let mut befores = Vec::new();
         let mut warns = Vec::new();
         let c = convert_one(
-            "type = process\ncommand = /bin/sh -c 'mkdir -p /run/x && exec /usr/sbin/svc -E /x.log'\n",
+            "type = process\ncommand = /bin/sh -c \"mkdir -p /run/x && exec /usr/sbin/svc -E /x.log\"\n",
             "s",
             &dir,
             &mut pulls,
@@ -3421,7 +3423,7 @@ mod tests {
         .expect("converts");
         assert!(c.text.contains("type = script\n"), "got:\n{}", c.text);
         assert!(
-            c.text.contains("exec /bin/sh -c 'mkdir -p /run/x && exec /usr/sbin/svc -E /x.log'\n"),
+            c.text.contains("exec /bin/sh -c \"mkdir -p /run/x && exec /usr/sbin/svc -E /x.log\"\n"),
             "got:\n{}",
             c.text
         );
@@ -3440,7 +3442,7 @@ mod tests {
         // quoted + console loses the console, loudly (only script parses).
         let mut warns = Vec::new();
         let c = convert_one(
-            "type = process\ncommand = /bin/getty 'tty 1'\noptions: runs-on-console\n",
+            "type = process\ncommand = /bin/getty \"tty 1\"\noptions: runs-on-console\n",
             "g",
             &dir,
             &mut pulls,
@@ -3454,7 +3456,7 @@ mod tests {
         // quoted oneshot warns loudly (no shell available there).
         let mut warns = Vec::new();
         let _ = convert_one(
-            "type = scripted\ncommand = /bin/echo 'a  b'\n",
+            "type = scripted\ncommand = /bin/echo \"a  b\"\n",
             "o",
             &dir,
             &mut pulls,
