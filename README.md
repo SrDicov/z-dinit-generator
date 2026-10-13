@@ -23,8 +23,14 @@ z-dinit-generator convert /etc/dinit.d ./services.d
 zinit check ./services.d
 z-dinit-generator watch /etc/dinit.d ./services.d &
 z-dinit-generator dinitctl status sshd
+z-dinit-generator dinitctl list
+z-dinit-generator dinitctl is-started sshd
+z-dinit-generator dinitctl enable chronyd
+z-dinit-generator dinitctl catlog sshd
 z-dinit-generator compatd /run/dinitctl &
 ```
+
+`dinitctl` cubre el set completo de `dinitctl(8)` (`start/stop/restart/wake/release/trigger/unpin/reload/add-dep/rm-dep/enable/disable/catlog/signal/is-started/is-failed/setenv/unsetenv`, con `--no-wait/--pin/--force/--ignore-unstarted/--quiet/--offline/--services-dir/--from`), espera por defecto como el original y falla en voz alta donde no hay contraparte (`unload`, `shutdown`, `untrigger`).
 
 El `sh` histórico (`dinit-import.sh`, `dinitctl`) sigue ahí como
 envoltorio fino; lo autoritativo es el Rust (paridad byte-idéntica en CI).

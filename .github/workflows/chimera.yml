@@ -64,6 +64,10 @@ jobs:
           test "$(docker inspect -f '{{.State.Running}}' zb)" = true
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
           for s in sshd dbus-daemon chronyd crond udevd uuidd boot system early-env early-devmon device local.target early-cryptdisks compatd; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/dinitctl is-started compatd | tee dctl-probe.txt
+          grep -q 'STARTED' dctl-probe.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/dinitctl list | tee dctl-list.txt
+          grep -q 'compatd' dctl-list.txt
           docker exec zb sh -c 'test -S /run/dinitctl && echo compatd-sock-ok' | tee compatd-sock.txt
           grep -q 'compatd-sock-ok' compatd-sock.txt
           docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status compatd | grep -q ' running '
@@ -91,6 +95,8 @@ jobs:
             status.txt
             compatd-sock.txt
             devmon.txt
+            dctl-probe.txt
+            dctl-list.txt
             probe.txt
             zb.log
             corpus-scripts

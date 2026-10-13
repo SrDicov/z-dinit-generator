@@ -1098,48 +1098,402 @@ fn c4_reload(sock: &str) {
 
 // ---------- dinitctl ----------
 
+// ---------- dinitctl: the dinitctl(8) command set ----------
+//
+// Exit codes mirror dinitctl: 0 ok, 1 error/unimplemented, 2 usage.
+// Output stays C4-transparent (the reply line prints verbatim) except
+// where dinitctl defines its own (is-started/is-failed state words,
+// catlog contents, signal --list). Anything dinitctl accepts but zinit
+// cannot do either maps to the nearest real action (wake/release/trigger
+// start; unpin succeeds vacuously; reload re-converts) or fails loudly:
+// unload, shutdown and untrigger have no counterpart by design.
+
+fn resolve_outdir(flag: Option<&str>) -> std::path::PathBuf {
+    if let Some(d) = flag {
+        return std::path::PathBuf::from(d);
+    }
+    if let Ok(v) = std::env::var("ZINIT_CONFIG_DIRS") {
+        if let Some(last) = v.split(':').filter(|x| !x.is_empty()).last() {
+            return std::path::PathBuf::from(last);
+        }
+    }
+    std::path::PathBuf::from("/etc/zinit/services.d")
+}
+
+/// dinit source directories: --services-dir repeats, else the system pair
+/// (/etc shadows /usr/lib, like dinit's own overlay).
+fn dinit_source_dirs(extra: &[String]) -> Vec<std::path::PathBuf> {
+    if extra.is_empty() {
+        vec![
+            std::path::PathBuf::from("/etc/dinit.d"),
+            std::path::PathBuf::from("/usr/lib/dinit.d"),
+        ]
+    } else {
+        extra.iter().map(std::path::PathBuf::from).collect()
+    }
+}
+
+/// Find a service description: exact name, then the `base` of `base@arg`.
+fn find_dinit_file(dirs: &[std::path::PathBuf], name: &str) -> Option<std::path::PathBuf> {
+    for d in dirs {
+        let p = d.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(at) = name.rfind('@') {
+        let base = &name[..at];
+        if !base.is_empty() {
+            for d in dirs {
+                let q = d.join(base);
+                if q.is_file() {
+                    return Some(q);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The single `waits-for.d:` directory of a service file (dinit requires
+/// exactly one for enable/disable to make sense).
+fn waits_for_dir(svc_file: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let text = std::fs::read_to_string(svc_file).map_err(|e| format!("cannot read {}: {e}", svc_file.display()))?;
+    let mut found = Vec::new();
+    for ln in text.lines() {
+        let t = trim_spaces(ln);
+        for prefix in ["waits-for.d:", "waits-for.d="] {
+            if let Some(rest) = t.strip_prefix(prefix) {
+                found.push(trim_spaces(rest).to_string());
+            }
+        }
+    }
+    if found.len() != 1 {
+        return Err(format!("{} has {} waits-for.d dirs, need exactly 1", svc_file.display(), found.len()));
+    }
+    let dir = std::path::PathBuf::from(&found[0]);
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        svc_file.parent().unwrap_or(std::path::Path::new(".")).join(dir)
+    })
+}
+
+fn meta_enable_via(svc_file: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(svc_file).ok()?;
+    for ln in text.lines() {
+        let t = trim_spaces(ln);
+        let t = t.strip_prefix('@')?;
+        let mut it = t.split_whitespace();
+        if it.next()? != "meta" {
+            continue;
+        }
+        if it.next()? != "enable-via" {
+            continue;
+        }
+        return it.next().map(|x| x.to_string());
+    }
+    None
+}
+
+/// Re-convert the directory holding a dinit source file, then reload-all
+/// (skipped offline, where there is no daemon to tell).
+fn reconvert_and_reload(src_file: &std::path::Path, outdir: &std::path::Path, offline: bool) -> bool {
+    let parent = match src_file.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    if cmd_convert(parent, outdir) != 0 {
+        return false;
+    }
+    if offline {
+        return true;
+    }
+    let sock = zinit_socket(None);
+    matches!(c4_ask(&sock, "C dinitctl reload-all\n"), Some(r) if r.starts_with("R "))
+}
+
+/// Persist a dependency edge into the generated confs (shared with the
+/// compatd ADD_DEP path): REGULAR/MILESTONE are hard, WAITS_FOR is soft.
+fn dep_add_out(outdir: &std::path::Path, zsock: &str, from: &str, to: &str, dtype: u8) -> bool {
+    let tok = match dep_token(dtype, to) {
+        Some(x) => x,
+        None => return false,
+    };
+    let mut deps = match read_depends(outdir, from) {
+        Some(d) => d,
+        None => return false,
+    };
+    if deps.contains(&tok) {
+        return true;
+    }
+    if dtype == 0 {
+        if let (Some(fs), Some(ts)) = (z_status(zsock, from), z_status(zsock, to)) {
+            if fs.state != ST_STOPPED && ts.state != ST_STARTED {
+                return false;
+            }
+        }
+    }
+    if would_cycle(outdir, from, to) {
+        return false;
+    }
+    deps.push(tok);
+    if !write_depends(outdir, from, &deps) {
+        return false;
+    }
+    matches!(c4_ask(zsock, "C dinitctl reload-all\n"), Some(r) if r.starts_with("R "))
+}
+
+fn dep_remove_out(outdir: &std::path::Path, zsock: &str, from: &str, to: &str, dtype: u8) -> bool {
+    let tok = match dep_token(dtype, to) {
+        Some(x) => x,
+        None => return false,
+    };
+    let mut deps = match read_depends(outdir, from) {
+        Some(d) => d,
+        None => return false,
+    };
+    if !deps.contains(&tok) {
+        return false;
+    }
+    deps.retain(|d| d != &tok);
+    if !write_depends(outdir, from, &deps) {
+        return false;
+    }
+    matches!(c4_ask(zsock, "C dinitctl reload-all\n"), Some(r) if r.starts_with("R "))
+}
+
+fn signal_number(id: &str) -> Option<i32> {
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+        return id.parse::<i32>().ok().filter(|&n| (1..=64).contains(&n));
+    }
+    let name = id.strip_prefix("SIG_").or_else(|| id.strip_prefix("SIG")).unwrap_or(id);
+    let table: &[(&str, i32)] = &[
+        ("HUP", 1), ("INT", 2), ("QUIT", 3), ("ILL", 4), ("TRAP", 5), ("ABRT", 6),
+        ("BUS", 7), ("FPE", 8), ("KILL", 9), ("USR1", 10), ("SEGV", 11), ("USR2", 12),
+        ("PIPE", 13), ("ALRM", 14), ("TERM", 15), ("STKFLT", 16), ("CHLD", 17),
+        ("CONT", 18), ("STOP", 19), ("TSTP", 20), ("TTIN", 21), ("TTOU", 22),
+        ("URG", 23), ("XCPU", 24), ("XFSZ", 25), ("VTALRM", 26), ("PROF", 27),
+        ("WINCH", 28), ("IO", 29), ("PWR", 30), ("SYS", 31),
+    ];
+    for (n, v) in table {
+        if name.eq_ignore_ascii_case(n) {
+            return Some(*v);
+        }
+    }
+    if let Some(rest) = name.strip_prefix("RTMIN+") {
+        if let Ok(k) = rest.parse::<i32>() {
+            if (0..=30).contains(&k) {
+                return Some(34 + k);
+            }
+        }
+    }
+    if name.eq_ignore_ascii_case("RTMIN") {
+        return Some(34);
+    }
+    if name.eq_ignore_ascii_case("RTMAX") {
+        return Some(64);
+    }
+    None
+}
+
+fn wait_state(sock: &str, name: &str, want_running: bool, polls: u32) -> bool {
+    for _ in 0..polls {
+        match z_status(sock, name) {
+            Some(st) if (st.state == ST_STARTED) == want_running => return true,
+            None => return false,
+            _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
+    z_status(sock, name).map(|st| (st.state == ST_STARTED) == want_running).unwrap_or(false)
+}
+
+fn state_word(sock: &str, name: &str) -> Option<&'static str> {
+    match z_status(sock, name) {
+        Some(st) => Some(match st.state {
+            1 => "STARTING",
+            2 => "STARTED",
+            3 => "STOPPING",
+            _ => "STOPPED",
+        }),
+        None => None,
+    }
+}
+
+#[derive(Default)]
+struct DctlOpts {
+    socket: Option<String>,
+    user_sock: bool,
+    quiet: bool,
+    no_wait: bool,
+    pin: bool,
+    force: bool,
+    ignore_unstarted: bool,
+    clear: bool,
+    offline: bool,
+    sdirs: Vec<String>,
+    from: Option<String>,
+    out: Option<String>,
+    list_flag: bool,
+}
+
+fn dctl_usage() -> i32 {
+    eprintln!("usage: dinitctl [options] <start|stop|status|list|restart|wake|release|unpin|unload|reload|shutdown|add-dep|rm-dep|enable|disable|trigger|untrigger|setenv|unsetenv|is-started|is-failed|catlog|signal> [...]");
+    1
+}
+
 fn cmd_dinitctl(args: &[String]) -> i32 {
-    let mut argv: Vec<String> = args.to_vec();
-    // strip --use-passed-cfd and --
-    let mut clean: Vec<String> = Vec::new();
+    cmd_dinitctl_sock(args, None)
+}
+
+fn cmd_dinitctl_sock(args: &[String], sock_override: Option<&str>) -> i32 {
+    let mut o = DctlOpts::default();
+    let mut words: Vec<String> = Vec::new();
     let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
+    while i < args.len() {
+        match args[i].as_str() {
             "--use-passed-cfd" => {}
             "--" => {
-                clean.extend_from_slice(&argv[i + 1..]);
+                words.extend_from_slice(&args[i + 1..]);
                 break;
             }
+            "--socket-path" | "-p" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.socket = Some(v.clone()),
+                    None => return dctl_usage(),
+                }
+            }
+            "--system" | "-s" => {}
+            "--user" | "-u" => o.user_sock = true,
+            "--quiet" => o.quiet = true,
+            "--no-wait" => o.no_wait = true,
+            "--pin" => o.pin = true,
+            "--force" => o.force = true,
+            "--ignore-unstarted" => o.ignore_unstarted = true,
+            "--clear" => o.clear = true,
+            "--offline" | "-o" => o.offline = true,
+            "--services-dir" | "-d" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.sdirs.push(v.clone()),
+                    None => return dctl_usage(),
+                }
+            }
+            "--from" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.from = Some(v.clone()),
+                    None => return dctl_usage(),
+                }
+            }
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => o.out = Some(v.clone()),
+                    None => return dctl_usage(),
+                }
+            }
+            "--list" | "-l" => o.list_flag = true,
+            "--help" | "-h" => {
+                dctl_usage();
+                return 0;
+            }
+            "--version" => {
+                println!("z-dinit-generator {VERSION} (dinitctl compat)");
+                return 0;
+            }
             s if s.starts_with('-') => {
-                warn(&format!("unknown flag {}", argv[i]));
+                warn(&format!("unknown flag {}", args[i]));
                 return 1;
             }
-            _ => clean.push(argv[i].clone()),
+            _ => words.push(args[i].clone()),
         }
         i += 1;
     }
-    argv = clean;
-    if argv.is_empty() {
-        eprintln!("usage: dinitctl <status|list|start|stop|restart|is-started|is-failed|setenv|unsetenv> [args]");
-        return 1;
+    if !o.sdirs.is_empty() && !o.offline {
+        warn("--services-dir is ignored without --offline");
     }
-    let cmd = argv[0].clone();
-    let rest = &argv[1..];
+    if std::env::var_os("DINIT_SOCKET_PATH").is_some() && !o.quiet {
+        warn("DINIT_SOCKET_PATH is ignored; the C4 socket is --socket-path/$ZINIT_SOCKET");
+    }
+    if words.is_empty() {
+        return dctl_usage();
+    }
+    // The socket to dial: explicit flag, then environment, then default.
+    // --user selects the per-user default instead of the system one.
+    let sock = match o.socket.clone().or_else(|| sock_override.map(|x| x.to_string())) {
+        Some(p) => p,
+        None => match std::env::var("ZINIT_SOCKET") {
+            Ok(v) => v,
+            Err(_) if o.user_sock => {
+                let base = std::env::var("XDG_RUNTIME_DIR")
+                    .or_else(|_| std::env::var("HOME").map(|h| format!("{h}/.local/run")))
+                    .unwrap_or_else(|_| String::from("/run"));
+                format!("{base}/zinit/ctl")
+            }
+            Err(_) => DEFAULT_SOCKET.to_string(),
+        },
+    };
+    let outdir = resolve_outdir(o.out.as_deref());
+    let qwarn = |m: String| {
+        if !o.quiet {
+            warn(&m);
+        }
+    };
+    let cmd = words[0].clone();
+    let rest = &words[1..];
+    // One C4 frame out, one reply line back; errors always print.
+    let passthrough = |verb: &str, name: &str| -> Result<String, String> {
+        if name.chars().any(char::is_whitespace) {
+            return Err(String::from("name with whitespace cannot cross C4"));
+        }
+        c4_transact(&sock, &format!("C dinitctl {verb} {name}\n"))
+    };
+    // start/stop-family with dinitctl waiting semantics (wait by default).
+    let run_action = |verb: &str, name: &str, want_running: bool| -> i32 {
+        match passthrough(verb, name) {
+            Ok(reply) => {
+                if !o.quiet {
+                    print!("{reply}");
+                }
+                if reply.starts_with("R ") {
+                    if o.pin {
+                        qwarn(format!("--pin has no effect here; {name} is simply {verb}ed"));
+                    }
+                    if o.force {
+                        qwarn("--force has no extra effect here; stops already cascade".to_string());
+                    }
+                    if !o.no_wait && !wait_state(&sock, name, want_running, 300) {
+                        qwarn(format!("{name} did not reach the target state in time"));
+                        return 1;
+                    }
+                    0
+                } else if o.ignore_unstarted {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                warn(&e);
+                1
+            }
+        }
+    };
     match cmd.as_str() {
         "setenv" | "unsetenv" => {
-            warn(&format!(
-                "{} {} (no activation environment under zinit; ignored)",
-                cmd,
-                rest.join(" ")
-            ));
+            // Accepted no-ops (no activation environment under zinit).
+            // setenv NAME (bare) would read our own environment upstream;
+            // there is nowhere to export it to, so it is announced too.
+            qwarn(format!("{} {} (no activation environment under zinit; ignored)", cmd, rest.join(" ")));
             0
         }
-        "status" | "list" | "start" | "stop" | "restart" => {
-            if rest.iter().any(|s| s.chars().any(char::is_whitespace)) {
-                warn("name with whitespace cannot cross C4");
+        "status" | "list" => {
+            if rest.iter().any(|x| x.chars().any(char::is_whitespace)) {
+                warn("name with whitespace cannot cross C4".to_string());
                 return 1;
             }
-            let sock = zinit_socket(None);
             let mut frame = format!("C dinitctl {cmd}");
             for r in rest {
                 frame.push(' ');
@@ -1148,7 +1502,9 @@ fn cmd_dinitctl(args: &[String]) -> i32 {
             frame.push('\n');
             match c4_transact(&sock, &frame) {
                 Ok(reply) => {
-                    print!("{reply}");
+                    if !o.quiet {
+                        print!("{reply}");
+                    }
                     if reply.starts_with("R ") {
                         0
                     } else {
@@ -1161,60 +1517,262 @@ fn cmd_dinitctl(args: &[String]) -> i32 {
                 }
             }
         }
+        "start" | "wake" | "trigger" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            // wake/trigger mark nothing here: every start is explicit and
+            // every oneshot fires at once (documented collapse).
+            run_action("start", &rest[0], true)
+        }
+        "stop" | "release" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            run_action("stop", &rest[0], false)
+        }
+        "restart" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            run_action("restart", &rest[0], true)
+        }
         "is-started" => {
             if rest.len() != 1 {
-                warn("usage: dinitctl is-started <svc>");
-                return 1;
+                return dctl_usage();
             }
-            let sock = zinit_socket(None);
-            let frame = format!("C dinitctl status {}\n", rest[0]);
-            match c4_transact(&sock, &frame) {
-                Ok(reply) => {
-                    if reply.contains(" running ") {
+            match state_word(&sock, &rest[0]) {
+                Some(w) => {
+                    if !o.quiet {
+                        println!("{w}");
+                    }
+                    if w == "STARTED" {
                         0
                     } else {
                         1
                     }
                 }
-                Err(_) => 1,
+                None => {
+                    qwarn(format!("{}: unknown service", rest[0]));
+                    1
+                }
             }
         }
         "is-failed" => {
             if rest.len() != 1 {
-                warn("usage: dinitctl is-failed <svc>");
-                return 1;
+                return dctl_usage();
             }
-            let sock = zinit_socket(None);
-            let frame = format!("C dinitctl status {}\n", rest[0]);
-            match c4_transact(&sock, &frame) {
-                Ok(reply) => {
-                    if !reply.contains(" stopped desired=up ") {
-                        return 1;
+            match z_status(&sock, &rest[0]) {
+                Some(st) => {
+                    let word = match st.state {
+                        1 => "STARTING",
+                        2 => "STARTED",
+                        3 => "STOPPING",
+                        _ => "STOPPED",
+                    };
+                    if !o.quiet {
+                        println!("{word}");
                     }
-                    let r = match reply.find("restarts=") {
-                        Some(p) => reply[p + 9..].split_whitespace().next().unwrap_or(""),
-                        None => return 1,
-                    };
-                    let (a, b) = match r.split_once('/') {
-                        Some(t) => t,
-                        None => return 1,
-                    };
-                    let (a, b): (u64, u64) = match (a.parse(), b.parse()) {
-                        (Ok(a), Ok(b)) => (a, b),
-                        _ => return 1,
-                    };
-                    if a >= b && b > 0 {
+                    if st.state == ST_STOPPED && st.exhausted {
                         0
                     } else {
                         1
                     }
                 }
-                Err(_) => 1,
+                None => {
+                    qwarn(format!("{}: unknown service", rest[0]));
+                    1
+                }
             }
         }
-        "trigger" | "wake" => {
-            warn(&format!("{cmd}: no trigger concept under zinit; use start"));
+        "unpin" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            // Nothing is ever pinned: always a success.
+            0
+        }
+        "unload" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            warn("unload: services live in files, there is nothing transient to unload".to_string());
             1
+        }
+        "shutdown" => {
+            if !rest.is_empty() {
+                return dctl_usage();
+            }
+            warn("shutdown: zinit has no poweroff/reboot path by design".to_string());
+            1
+        }
+        "untrigger" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            warn("untrigger: delayed start has no counterpart; use stop".to_string());
+            1
+        }
+        "reload" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            let dirs = dinit_source_dirs(&o.sdirs);
+            match find_dinit_file(&dirs, &rest[0]) {
+                Some(f) => {
+                    if reconvert_and_reload(&f, &outdir, o.offline) {
+                        0
+                    } else {
+                        warn(format!("reload {} failed", rest[0]));
+                        1
+                    }
+                }
+                None => {
+                    qwarn(format!("{}: unknown service", rest[0]));
+                    1
+                }
+            }
+        }
+        "add-dep" | "rm-dep" => {
+            if rest.len() != 3 {
+                return dctl_usage();
+            }
+            let dtype = match rest[0].as_str() {
+                "need" => 0,
+                "regular" => {
+                    qwarn("regular is a deprecated alias of need".to_string());
+                    0
+                }
+                "milestone" => 3,
+                "waits-for" => 2,
+                _ => return dctl_usage(),
+            };
+            let ok = if cmd == "add-dep" {
+                dep_add_out(&outdir, &sock, &rest[1], &rest[2], dtype)
+            } else {
+                dep_remove_out(&outdir, &sock, &rest[1], &rest[2], dtype)
+            };
+            if ok {
+                0
+            } else {
+                warn(format!("{} {} -> {} refused", cmd, rest[1], rest[2]));
+                1
+            }
+        }
+        "enable" | "disable" => {
+            // enable [--from F] T / disable [--from F] T, over the dinit
+            // source dirs (offline = files only, no daemon contact).
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            let to = rest[0].clone();
+            let dirs = dinit_source_dirs(&o.sdirs);
+            let to_file = match find_dinit_file(&dirs, &to) {
+                Some(f) => f,
+                None => {
+                    qwarn(format!("{to}: unknown service"));
+                    return 1;
+                }
+            };
+            let from = match o.from.clone() {
+                Some(f) => f,
+                None => meta_enable_via(&to_file).unwrap_or_else(|| String::from("boot")),
+            };
+            let dir = match waits_for_dir(&to_file) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn(&e);
+                    return 1;
+                }
+            };
+            if cmd == "enable" {
+                if std::fs::create_dir_all(&dir).is_err() {
+                    warn(format!("cannot create {}", dir.display()));
+                    return 1;
+                }
+                let link = dir.join(&from);
+                if !link.exists() {
+                    let target = find_dinit_file(&dirs, &from).unwrap_or_else(|| std::path::PathBuf::from(&from));
+                    if std::os::unix::fs::symlink(&target, &link).is_err() {
+                        warn(format!("cannot link {}", link.display()));
+                        return 1;
+                    }
+                }
+            } else if std::fs::remove_file(dir.join(&from)).is_err() {
+                qwarn(format!("{from} is not enabled on {to}"));
+                return 1;
+            }
+            if reconvert_and_reload(&to_file, &outdir, o.offline) {
+                0
+            } else {
+                warn(format!("{cmd} {from} -> {to} failed"));
+                1
+            }
+        }
+        "catlog" => {
+            if rest.len() != 1 {
+                return dctl_usage();
+            }
+            let conf = outdir.join(format!("{}.conf", rest[0]));
+            let path = match std::fs::read_to_string(&conf).ok().and_then(|text| {
+                text.lines().find_map(|l| l.strip_prefix("log = file:").map(|x| x.to_string()))
+            }) {
+                Some(p) => p,
+                None => {
+                    qwarn(format!("{}: no file log", rest[0]));
+                    return 1;
+                }
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(data) => {
+                    print!("{data}");
+                    if o.clear && std::fs::write(&path, "").is_err() {
+                        warn(format!("cannot clear {path}"));
+                        return 1;
+                    }
+                    0
+                }
+                Err(e) => {
+                    warn(&format!("cannot read {path}: {e}"));
+                    1
+                }
+            }
+        }
+        "signal" => {
+            if o.list_flag && rest.is_empty() {
+                println!("HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH IO PWR SYS RTMIN-RTMAX");
+                return 0;
+            }
+            if rest.len() != 2 {
+                return dctl_usage();
+            }
+            let signum = match signal_number(&rest[0]) {
+                Some(n) => n,
+                None => {
+                    warn(format!("unknown signal {}", rest[0]));
+                    return 1;
+                }
+            };
+            match z_status(&sock, &rest[1]).and_then(|st| st.has_pid.then_some(st.pid)) {
+                Some(pid) => {
+                    match std::process::Command::new("kill")
+                        .arg("-s")
+                        .arg(signum.to_string())
+                        .arg(pid.to_string())
+                        .status()
+                    {
+                        Ok(st) if st.success() => 0,
+                        _ => {
+                            warn(format!("signal not delivered to {}", rest[1]));
+                            1
+                        }
+                    }
+                }
+                None => {
+                    qwarn(format!("{}: no running process", rest[1]));
+                    1
+                }
+            }
         }
         _ => {
             warn(&format!("unknown command {cmd}"));
@@ -2586,7 +3144,11 @@ mod tests {
                     } else if w.len() >= 3 && w[2] == "list" {
                         "R compatd 0 2 a=running b=stopped\n"
                     } else if w.len() >= 4 && (w[2] == "start" || w[2] == "stop" || w[2] == "restart") {
-                        "R compatd 0\n"
+                        if w[3] == "nosuch" {
+                            "E compatd 3 unknown service\n"
+                        } else {
+                            "R compatd 0\n"
+                        }
                     } else if w.len() >= 3 && w[2] == "reload-all" {
                         reloaded.store(true, Ordering::SeqCst);
                         "R compatd 0\n"
@@ -2703,6 +3265,168 @@ mod tests {
         assert!(reloaded.load(Ordering::SeqCst));
         drop(client);
         h.join().unwrap();
+    }
+
+    fn dctl(sock: &str, args: &[&str]) -> i32 {
+        let v: Vec<String> = args.iter().map(|x| x.to_string()).collect();
+        cmd_dinitctl_sock(&v, Some(sock))
+    }
+
+    #[test]
+    fn dctl_signal_numbers() {
+        assert_eq!(signal_number("15"), Some(15));
+        assert_eq!(signal_number("TERM"), Some(15));
+        assert_eq!(signal_number("term"), Some(15));
+        assert_eq!(signal_number("SIGKILL"), Some(9));
+        assert_eq!(signal_number("RTMIN+5"), Some(39));
+        assert_eq!(signal_number("0"), None);
+        assert_eq!(signal_number("65"), None);
+        assert_eq!(signal_number("BOGUS"), None);
+    }
+
+    #[test]
+    fn dctl_add_rm_dep_verbs() {
+        use std::sync::atomic::Ordering;
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded.clone());
+        let out = tmpout("dctl-dep");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\n").unwrap();
+        let od = out.display().to_string();
+        // need with a running and b stopped contradicts the states -> refused.
+        assert_eq!(dctl(&zsock, &["add-dep", "need", "a", "b", "--out", &od]), 1);
+        // waits-for persists.
+        assert_eq!(dctl(&zsock, &["add-dep", "waits-for", "a", "b", "--out", &od]), 0);
+        let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
+        assert!(text.contains("depends = opt:b\n"), "got: {text}");
+        assert!(reloaded.load(Ordering::SeqCst));
+        // milestone is hard.
+        assert_eq!(dctl(&zsock, &["add-dep", "milestone", "b", "a", "--out", &od]), 0);
+        let text = std::fs::read_to_string(out.join("b.conf")).unwrap();
+        assert!(text.contains("depends = a\n"), "got: {text}");
+        // junk type is a usage error.
+        assert_eq!(dctl(&zsock, &["add-dep", "before", "a", "b", "--out", &od]), 1);
+        // removal works once, then refuses.
+        assert_eq!(dctl(&zsock, &["rm-dep", "waits-for", "a", "b", "--out", &od]), 0);
+        assert_eq!(dctl(&zsock, &["rm-dep", "waits-for", "a", "b", "--out", &od]), 1);
+    }
+
+    #[test]
+    fn dctl_enable_disable_offline() {
+        let dd = tmpout("dctl-dd");
+        std::fs::write(dd.join("to"), "type = process\ncommand = /bin/t\nwaits-for.d: w\n").unwrap();
+        std::fs::write(dd.join("boot"), "type = internal\n").unwrap();
+        let out = tmpout("dctl-dout");
+        let dd_s = dd.display().to_string();
+        let od = out.display().to_string();
+        // default from is boot (no @meta present).
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["enable", "to", "--offline", "-d", &dd_s, "--out", &od]),
+            0
+        );
+        assert!(dd.join("w").join("boot").is_symlink());
+        // disabling twice: ok then refused.
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["disable", "to", "--offline", "-d", &dd_s, "--out", &od]),
+            0
+        );
+        assert!(!dd.join("w").join("boot").exists());
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["disable", "to", "--offline", "-d", &dd_s, "--out", &od]),
+            1
+        );
+        // unknown target refuses.
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["enable", "nosuch", "--offline", "-d", &dd_s, "--out", &od]),
+            1
+        );
+        // --from selects the dependent.
+        assert_eq!(
+            dctl(
+                "/tmp/zdg-no-such-sock-xyz",
+                &["enable", "--from", "extra", "to", "--offline", "-d", &dd_s, "--out", &od]
+            ),
+            0
+        );
+        assert!(dd.join("w").join("extra").is_symlink());
+    }
+
+    #[test]
+    fn dctl_enable_needs_exactly_one_waits_dir() {
+        let dd = tmpout("dctl-dd2");
+        std::fs::write(dd.join("to"), "type = process\ncommand = /bin/t\n").unwrap();
+        let out = tmpout("dctl-dout2");
+        let dd_s = dd.display().to_string();
+        let od = out.display().to_string();
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["enable", "to", "--offline", "-d", &dd_s, "--out", &od]),
+            1
+        );
+    }
+
+    #[test]
+    fn dctl_start_family_and_refusals() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        // wake/trigger collapse onto start; release onto stop.
+        assert_eq!(dctl(&zsock, &["wake", "a"]), 0);
+        assert_eq!(dctl(&zsock, &["trigger", "a"]), 0);
+        assert_eq!(dctl(&zsock, &["release", "b"]), 0);
+        assert_eq!(dctl(&zsock, &["restart", "a"]), 0);
+        assert_eq!(dctl(&zsock, &["unpin", "a"]), 0);
+        // stop on an unknown service with --ignore-unstarted succeeds.
+        assert_eq!(dctl(&zsock, &["stop", "--ignore-unstarted", "--no-wait", "nosuch"]), 0);
+        assert_eq!(dctl(&zsock, &["stop", "--no-wait", "nosuch"]), 1);
+        assert_eq!(dctl(&zsock, &["signal", "--list"]), 0);
+        // loud refusals.
+        assert_eq!(dctl(&zsock, &["unload", "a"]), 1);
+        assert_eq!(dctl(&zsock, &["shutdown"]), 1);
+        assert_eq!(dctl(&zsock, &["untrigger", "a"]), 1);
+        assert_eq!(dctl(&zsock, &["frobnicate"]), 1);
+        assert_eq!(dctl(&zsock, &[]), 1);
+        assert_eq!(dctl(&zsock, &["--bogus", "list"]), 1);
+        // setenv stays an accepted no-op, multi-arg included.
+        assert_eq!(dctl(&zsock, &["setenv", "A=1", "B"]), 0);
+        assert_eq!(dctl(&zsock, &["is-started", "a"]), 0);
+        assert_eq!(dctl(&zsock, &["is-started", "b"]), 1);
+        assert_eq!(dctl(&zsock, &["is-failed", "b"]), 1);
+    }
+
+    #[test]
+    fn dctl_catlog_and_clear() {
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("dctl-cat");
+        let logp = out.join("s.log");
+        std::fs::write(&logp, "logged\n").unwrap();
+        std::fs::write(
+            out.join("a.conf"),
+            format!("type = process\ncommand = /bin/a\nlog = file:{}\n", logp.display()),
+        )
+        .unwrap();
+        let od = out.display().to_string();
+        assert_eq!(dctl(&zsock, &["catlog", "a", "--out", &od]), 0);
+        assert_eq!(dctl(&zsock, &["catlog", "--clear", "a", "--out", &od]), 0);
+        assert_eq!(std::fs::read_to_string(&logp).unwrap(), "");
+        assert_eq!(dctl(&zsock, &["catlog", "b", "--out", &od]), 1);
+    }
+
+    #[test]
+    fn dctl_reload_offline_reconverts() {
+        let dd = tmpout("dctl-rl");
+        std::fs::write(dd.join("a"), "type = process\ncommand = /bin/a\n").unwrap();
+        let out = tmpout("dctl-rlout");
+        let dd_s = dd.display().to_string();
+        let od = out.display().to_string();
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["reload", "a", "--offline", "-d", &dd_s, "--out", &od]),
+            0
+        );
+        assert!(out.join("a.conf").is_file());
+        assert_eq!(
+            dctl("/tmp/zdg-no-such-sock-xyz", &["reload", "nosuch", "--offline", "-d", &dd_s, "--out", &od]),
+            1
+        );
     }
 
     #[test]
