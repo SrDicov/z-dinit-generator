@@ -204,7 +204,10 @@ try:
     dl = struct.unpack("<I", dh[1:5])[0]
     check("dscdir", dh[0] == 77 and c2.read(dl).decode() == OUT, repr(dh))
     c2.raw(bytes([13]))
-    check("loadmech", c2.read(2) == bytes([64, 1]))
+    lm = c2.read(6)
+    total = struct.unpack("<I", lm[2:6])[0]
+    lm_rest = c2.read(total - 6)
+    check("loadmech", lm[0] == 64 and lm[1] == 1 and OUT.encode() in lm_rest, repr(lm))
     # 14. env paths
     c2.raw(bytes([17]) + struct.pack("<H", 3) + b"a=b")
     check("setenv", c2.read(1) == bytes([50]))
