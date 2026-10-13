@@ -107,13 +107,6 @@ fn is_blank_spaces(s: &str) -> bool {
     s.is_empty() || s.bytes().all(|b| b == b' ')
 }
 
-fn dur(v: &str) -> String {
-    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
-        format!("{v}s")
-    } else {
-        v.to_string()
-    }
-}
 
 fn squote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -333,21 +326,34 @@ fn sub_arg1(v: &str, n: &str, warns: &mut Vec<String>) -> String {
     o.replace("\u{0}", "$$")
 }
 
-/// dinit seconds (`XXX.YYY`) into zinit duration spelling.
-fn bardur(v: &str) -> Option<String> {
+/// dinit seconds (`XXX.YYY`) into zinit duration spelling. Whole
+/// seconds stay `Ns`; fractions become `Nms` (zinit rejects `1.5s`).
+fn dinit_secs(v: &str) -> Option<String> {
     if v.is_empty() {
         return None;
     }
-    let mut dot = false;
-    for c in v.chars() {
-        if c.is_ascii_digit() {
-        } else if c == '.' && !dot {
-            dot = true;
-        } else {
-            return None;
+    let (int, frac) = match v.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (v, None),
+    };
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match frac {
+        None => Some(format!("{int}s")),
+        Some(f) => {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut ms: u64 = int.parse().unwrap_or(0).saturating_mul(1000);
+            let mut scale = 100u64;
+            for c in f.chars().take(3) {
+                ms = ms.saturating_add((c as u64 - '0' as u64) * scale);
+                scale /= 10;
+            }
+            Some(format!("{ms}ms"))
         }
     }
-    Some(format!("{v}s"))
 }
 
 /// dinit `soft:hard` limit into the soft value zinit keeps.
@@ -449,6 +455,7 @@ fn convert_one(
     let mut extra_net: Vec<String> = Vec::new();
     let mut extra_rl: Vec<String> = Vec::new();
     let mut extra_cg = String::new();
+    let mut extra_tty = String::new();
 
     for ln in gather_lines(file_text, in_dir, 0, n, warns) {
         let (k_raw, v_raw, ap) = match split_line(&ln) {
@@ -549,11 +556,11 @@ fn convert_one(
                 "on-failure" => restart = "on-failure".to_string(),
                 _ => w!(format!("restart={v} ignored")),
             },
-            "restart-delay" => match bardur(&v) {
+            "restart-delay" => match dinit_secs(&v) {
                 Some(d) => rdelay = d,
                 None => w!(format!("restart-delay {v} ignored")),
             },
-            "restart-limit-interval" => match bardur(&v) {
+            "restart-limit-interval" => match dinit_secs(&v) {
                 Some(d) => rinterval = d,
                 None => w!(format!("restart-limit-interval {v} ignored")),
             },
@@ -587,8 +594,14 @@ fn convert_one(
                     }
                 }
             }
-            "stop-timeout" => stop = dur(&v),
-            "start-timeout" => start = dur(&v),
+            "stop-timeout" => match dinit_secs(&v) {
+                Some(d) => stop = d,
+                None => w!("stop-timeout {v} ignored"),
+            },
+            "start-timeout" => match dinit_secs(&v) {
+                Some(d) => start = d,
+                None => w!("start-timeout {v} ignored"),
+            },
             "run-as" => user = v,
             "working-dir" => wdir = sub_arg1(&v, n, warns),
             "logfile" => log = format!("file:{}", sub_arg1(&v, n, warns)),
@@ -777,7 +790,10 @@ fn convert_one(
     }
     if run_console {
         match zt_owned.as_str() {
-            "process" | "script" => zt_owned = "console".to_string(),
+            "process" | "script" => {
+                zt_owned = "console".to_string();
+                extra_tty = "tty = /dev/console".to_string();
+            }
             _ => w!("console option needs a process service, ignored".to_string()),
         }
     }
@@ -837,6 +853,9 @@ fn convert_one(
     let mut o = String::new();
     o.push_str(&format!("type = {zt_owned}\n"));
     o.push_str(&format!("command = {command}\n"));
+    if !extra_tty.is_empty() {
+        o.push_str(&format!("{extra_tty}\n"));
+    }
     if !deps.is_empty() {
         o.push_str(&format!("depends = {deps}\n"));
     }
@@ -2413,10 +2432,12 @@ mod tests {
     }
 
     #[test]
-    fn dur_appends_s_to_bare_numbers() {
-        assert_eq!(dur("5"), "5s");
-        assert_eq!(dur("5s"), "5s");
-        assert_eq!(dur("1m"), "1m");
+    fn dinit_secs_spelling() {
+        assert_eq!(dinit_secs("5"), Some("5s".to_string()));
+        assert_eq!(dinit_secs("5s"), None);
+        assert_eq!(dinit_secs("0.5"), Some("500ms".to_string()));
+        assert_eq!(dinit_secs("10.25"), Some("10250ms".to_string()));
+        assert_eq!(dinit_secs(""), None);
     }
 
     #[test]
@@ -2629,10 +2650,11 @@ mod tests {
         let c = convert_one(text, "svc", &dir, &mut pulls, &mut befores, &mut warns)
             .expect("converts");
         assert!(c.text.contains("type = console\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("tty = /dev/console\n"), "got:\n{}", c.text);
         assert!(c.text.contains("command = /bin/srv %i --x=a  b\n"), "got:\n{}", c.text);
         assert!(c.text.contains("depends = net, opt:other\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-budget = 5 restarts per 20s\n"), "got:\n{}", c.text);
-        assert!(c.text.contains("restart-delay = 0.5s\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("restart-delay = 500ms\n"), "got:\n{}", c.text);
         assert!(c.text.contains("listen = unix:/run/s.sock\n"), "got:\n{}", c.text);
         assert!(c.text.contains("cgroup = /sys/fs/cgroup/sys\n"), "got:\n{}", c.text);
         assert!(c.text.contains("rlimit-nofile = 1024\n"), "got:\n{}", c.text);

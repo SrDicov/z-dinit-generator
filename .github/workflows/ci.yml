@@ -139,7 +139,8 @@ jobs:
           grep -q '^type = console$' kout/svc.conf
           grep -q 'command = /bin/srv %i' kout/svc.conf
           grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf
-          grep -q '^restart-delay = 0.5s$' kout/svc.conf
+          grep -q '^restart-delay = 500ms$' kout/svc.conf
+          grep -q '^tty = /dev/console$' kout/svc.conf
           grep -q '^listen = unix:/run/s.sock$' kout/svc.conf
           grep -q '^cgroup = /sys/fs/cgroup/sys$' kout/svc.conf
           grep -q '^rlimit-nofile = 1024$' kout/svc.conf
