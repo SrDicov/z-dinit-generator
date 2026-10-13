@@ -1369,7 +1369,7 @@ fn serve_one(
                         // do_enable: a started dependent pulls the dependency.
                         if let Some(fs) = z_status(&ctx.zsock, &from) {
                             if fs.state == ST_STARTED || fs.state == 1 {
-                                z_act("start", &to);
+                                z_act(&ctx.zsock, "start", &to);
                             }
                         }
                     }
@@ -2002,6 +2002,38 @@ mod tests {
     }
 
     // compatd protocol conformance (byte-exact vs control.cc).
+    fn pair() -> (UnixStream, UnixStream) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zdg-compatd-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ctl");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        (server, client)
+    }
+
+    fn read_exact(client: &mut UnixStream, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let mut got = 0;
+        while got < n {
+            match client.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        buf.truncate(got);
+        buf
+    }
+
     fn fctx() -> Ctx {
         Ctx {
             outdir: std::env::temp_dir().join("zdg-no-such-outdir"),
