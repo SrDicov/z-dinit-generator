@@ -341,3 +341,30 @@ remaining dinitctl verbs (catlog/signal/enable/disable), per-VM
   gaps filed: cgroup= join breaks spawn, notify protocol vs
   dinit pipefd:N unmapped, convert idempotency, check-vs-sup
   strictness on unknown deps, no type=target emission.
+
+## 2026-10-14 — Chimera FULL tree (72 svc) green under zinit
+
+- Merged tree (usr 62 + etc) converts clean; musl v0.0.2 runs it.
+  Static musl zdg BUILT LOCALLY (rustc --target
+  x86_64-unknown-linux-musl, allowed by rules for the std-only
+  generator; 5.1MB static PIE, matrix/zdg-musl-static) and deployed
+  to the VM: compatd live + dinitctl symlink. TODO: CI musl-static
+  artifact job so legs stop depending on a local binary.
+- Results: 12 running (incl. dbus-daemon, udevd, sshd, dhcpcd→static
+  net, polkitd, elogind, early-devmon, gettys), rest completed or
+  correctly disabled; ANOM=0 silent-stuck. dinitctl shim proven on
+  musl (is-started ×2, 71-svc list); early-env ambient crash FIXED
+  by the shim (completed after 2 early fails).
+- Classified, not chased: dinit-dbus (hangs talking to compatd —
+  needs a focused protocol session), device/early-devmon %i
+  instances (need compatd instance synthesis), zram-device (needs
+  distro size config), wpa/mdadm/recovery (no HW / not demanded).
+- dbus-sync dep on dinit-dbus dropped (bus itself is up; bridge
+  tracked separately). notify-handshake services (polkitd,
+  elogind) work fine — the earlier dbus notify scare was the
+  print-address fd dance, Artix-side lesson stands.
+- Ops: ssh-authorized_keys baked into ALL FOUR stagings (console
+  FIFO is now backup only); static net.sh replaces blind dhcpcd
+  on musl legs; `background:true` flaked repeatedly — setsid+&
+  +disown in short calls is the reliable launcher; always verify
+  qemu via /proc/$pid/exe (comm truncates, patterns self-match).
