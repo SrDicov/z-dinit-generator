@@ -529,7 +529,6 @@ fn convert_one(
     let mut extra_env: Vec<String> = Vec::new();
     let mut extra_net: Vec<String> = Vec::new();
     let mut extra_rl: Vec<String> = Vec::new();
-    let mut extra_cg = String::new();
     let mut extra_tty = String::new();
 
     for ln in gather_lines(file_text, in_dir, 0, n, warns) {
@@ -781,7 +780,13 @@ fn convert_one(
                 if v.is_empty() {
                     w!("run-in-cgroup empty, ignored".to_string());
                 } else {
-                    extra_cg = format!("cgroup = {v}");
+                    // ponytail: dropped, not mapped. The supervisor's
+                    // cgroup join breaks supervised children (every
+                    // cgroup= service dies pre-exec; manual joins work),
+                    // so emitting it would trade limits for a dead
+                    // service. Re-enable with the value intact once the
+                    // join is fixed; the warn keeps the debt visible.
+                    w!(format!("run-in-cgroup {v} dropped: cgroup join broken, service runs without limits"));
                 }
             }
             "capabilities" | "securebits" => {
@@ -1021,9 +1026,6 @@ fn convert_one(
     }
     for e in &extra_rl {
         o.push_str(&format!("{e}\n"));
-    }
-    if !extra_cg.is_empty() {
-        o.push_str(&format!("{extra_cg}\n"));
     }
     if zt_owned == "forking" && !pid.is_empty() {
         o.push_str(&format!("pid-file = {pid}\n"));
@@ -3590,13 +3592,14 @@ mod tests {
         assert!(c.text.contains("restart-budget = 5 restarts per 20s\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-delay = 500ms\n"), "got:\n{}", c.text);
         assert!(c.text.contains("listen = unix:/run/s.sock\n"), "got:\n{}", c.text);
-        assert!(c.text.contains("cgroup = /sys/fs/cgroup/sys\n"), "got:\n{}", c.text);
+        assert!(!c.text.contains("cgroup = "), "got:\n{}", c.text);
         assert!(c.text.contains("rlimit-nofile = 1024\n"), "got:\n{}", c.text);
         assert!(c.text.contains("env = FOO=bar\n"), "got:\n{}", c.text);
         assert!(c.text.contains("env = EMPTY=\n"), "got:\n{}", c.text);
         assert!(c.text.contains("env = DINIT_SERVICE=svc\n"), "got:\n{}", c.text);
         let w = warns.join("\n");
         assert!(w.contains("log-type buffer"), "got: {w}");
+        assert!(w.contains("run-in-cgroup"), "got: {w}");
         assert!(w.contains("option bogus-opt ignored"), "got: {w}");
         assert!(w.contains("rlimit-core ignored"), "got: {w}");
         assert!(w.contains("env-file line ignored: BADLINE"), "got: {w}");
