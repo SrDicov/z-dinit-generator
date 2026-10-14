@@ -401,3 +401,28 @@ TERM cascade with full announce. Matrix packaging state:
   stdin EOF; guest bash histexpand eats `!` (ssh for files).
 - Remaining e2e gaps: bootloader-native reboot (QEMU uses
   init= override), `-S` from real repos (tested -U local), soak.
+
+## 2026-10-14 — PACKAGING E2E closed (declared flow, in VM)
+
+`pacman -U zinit z-dinit-generator` → `start` (94 svc) →
+`pacman -R dinit` → reboot → zinit PID 1 via packaged /sbin/init
+flip → 35 running, compatd+dinitctl live, TERM cascade. All in
+Artix VM, all green:
+- install/start/remove/reboot/init-selection/probe/compat/verbs.
+- `z-dinit-generator reboot` verified (uptime reset; came back per
+  QEMU cmdline as designed — bootloader-native reboot untested).
+- Generator fixes landed for everything the e2e exposed:
+  idempotent enabled=no (6bf0118), before-mirror yield (e577fc4),
+  dotfile skip (8f82fe2), --print-address drop (f6c5e6e) — all CI
+  green. e2e re-ran with fixed bits where it mattered.
+- Packaging rules learned: staging must not ship package-owned
+  bins; dinitctl via untracked post_install symlink (tracked files
+  conflict with dinit-base); provides=('dinit') so -R works with
+  -dinit dependents present; .install scripts need to be in
+  source=(); ALWAYS verify installed sizes (0-byte ghost once).
+- Rescue path used twice (init=/bin/sh + host loop-mount).
+- Still open (not in VM): bootloader-native reboot, -S from real
+  repos (packages unpublished), multi-day soak, cgroup-join root
+  cause, dinit-dbus hang session, watch-vs-vanished-dirs,
+  check-vs-sup unknown-dep gap. Next milestone per user: fix every
+  open bug, then real remote-PC test.
