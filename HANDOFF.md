@@ -368,3 +368,36 @@ remaining dinitctl verbs (catlog/signal/enable/disable), per-VM
   on musl legs; `background:true` flaked repeatedly — setsid+&
   +disown in short calls is the reliable launcher; always verify
   qemu via /proc/$pid/exe (comm truncates, patterns self-match).
+
+## 2026-10-14 — PACKAGING E2E green in Artix VM (the declared flow)
+
+`pacman -U zinit + z-dinit-generator` → `z-dinit-generator start` →
+`pacman -R dinit` → reboot via `/sbin/init` → zinit PID 1, 35
+running, ANOM=3 (mdadm/recovery/wpa = dinit's not-loaded),
+compatd+dinitctl live (94-svc list/status/is-started/restart),
+TERM cascade with full announce. Matrix packaging state:
+- New `matrix/pkg/zinit/PKGBUILD` (binary repack of the CI-green
+  glibc artifact; packaging wraps tested bits, never rebuilds).
+- Generator PKGBUILD: `provides=('dinit')` (dependents of -dinit
+  subpackages stay satisfied so `-R dinit` works), dinitctl as an
+  UNTRACKED post_install symlink (tracked files conflict with
+  dinit-base — proven twice), zinit-init wrapper + /sbin/init flip
+  in zinit.install post_install (restore on remove).
+- Staging must NOT ship zinit bins (package owns /usr/bin/* or
+  plain -U fails on untracked files — hit live).
+- `start` regenerates everything from dinit sources: hand
+  seasoning (dbus-direct, root-ro-target) gets CLOBBERED on every
+  run — those two fixes belong upstream (backlog), seasoning does
+  not survive `start` by design. `start` on 8f82fe2-era binary
+  stacked dup enabled=no (E005, bricked a boot); 6bf0118 makes it
+  a fixed point, proven live (reconvert → reload clean, 94 svc).
+- dinit-watch has no future post `-R dinit` (watched dirs vanish)
+  — it backing-offs forever; needs graceful-degrade or removal
+  from the flow (backlog).
+- ALWAYS verify installed sizes (`/usr/bin/z-dinit-generator`
+  landed 0 bytes once from a suspect build; caught by --version).
+- Rescue path proven twice: init=/bin/sh + FIFO + host loop-mount
+  edits. FIFO console needs a persistent holder or qemu exits on
+  stdin EOF; guest bash histexpand eats `!` (ssh for files).
+- Remaining e2e gaps: bootloader-native reboot (QEMU uses
+  init= override), `-S` from real repos (tested -U local), soak.
