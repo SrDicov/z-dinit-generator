@@ -1063,9 +1063,24 @@ fn cmd_convert(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
         };
         let mut out = String::new();
         let mut hit = false;
+        // The mirror target: `a` is `opt:X` (soft ordering). If X is
+        // already listed — required or soft — adding it again either
+        // duplicates it or, worse, pairs `opt:X` with `X`, which zinit
+        // rejects (E010). A required edge already orders the pair, so
+        // skipping loses nothing.
+        let want = a.strip_prefix("opt:").unwrap_or(a.as_str());
         for l in cur.lines() {
             if l.starts_with("depends = ") {
-                out.push_str(&format!("depends = {a}, {}\n", &l["depends = ".len()..]));
+                let have = l["depends = ".len()..].split(',').any(|e| {
+                    let e = e.trim();
+                    e.strip_prefix("opt:").unwrap_or(e) == want
+                });
+                if have {
+                    out.push_str(l);
+                    out.push('\n');
+                } else {
+                    out.push_str(&format!("depends = {a}, {}\n", &l["depends = ".len()..]));
+                }
                 hit = true;
             } else {
                 out.push_str(l);
@@ -3188,6 +3203,43 @@ mod tests {
         assert!(c.text.contains("restart-budget = 3 restarts per 10s\n"));
         assert!(c.text.contains("log = none\n"));
         assert!(c.text.contains("ready = none\n"));
+    }
+
+    #[test]
+    fn before_mirror_skips_when_target_already_required() {
+        // elogind orders itself before logind, and logind genuinely
+        // requires elogind: mirroring `opt:elogind` onto logind would pair
+        // it with the required edge, which zinit rejects (E010). The
+        // required edge already orders the pair, so the mirror must yield.
+        let src = tmpout("before-src");
+        let out = tmpout("before-out");
+        std::fs::write(src.join("elogind"), "type = process\ncommand = /bin/e\nbefore = logind\n")
+            .unwrap();
+        std::fs::write(src.join("logind"), "type = internal\ndepends-on = elogind\n").unwrap();
+        assert_eq!(cmd_convert(&src, &out), 0);
+        let got = std::fs::read_to_string(out.join("logind.conf")).unwrap();
+        assert!(
+            !got.contains("opt:elogind"),
+            "soft mirror must not duplicate the required edge:\n{got}"
+        );
+        assert!(got.contains("elogind"), "required edge stays:\n{got}");
+    }
+
+    #[test]
+    fn before_mirror_orders_when_no_edge_exists() {
+        // Pure ordering (no dependency either way): the soft mirror is
+        // the only record of it, so it must survive.
+        let src = tmpout("before-src2");
+        let out = tmpout("before-out2");
+        std::fs::write(src.join("early"), "type = process\ncommand = /bin/e\nbefore = late\n")
+            .unwrap();
+        std::fs::write(src.join("late"), "type = process\ncommand = /bin/l\n").unwrap();
+        assert_eq!(cmd_convert(&src, &out), 0);
+        let got = std::fs::read_to_string(out.join("late.conf")).unwrap();
+        assert!(
+            got.contains("depends = opt:early"),
+            "soft ordering edge must be emitted:\n{got}"
+        );
     }
 
     // compatd protocol conformance (byte-exact vs control.cc).
