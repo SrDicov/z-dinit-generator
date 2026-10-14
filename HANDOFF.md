@@ -287,3 +287,35 @@ Deliberately open: full 61-svc Chimera tree in VM (CI container
 covers it), divergence classification list, packaging e2e installs,
 remaining dinitctl verbs (catlog/signal/enable/disable), per-VM
 15-min soaks (only Alpine did the full soak).
+
+## 2026-10-14 — Artix FULL tree under zinit (92 svc, in triage)
+
+- Merged tree (usr/lib base + etc overrides) converts clean with
+  8f82fe2 (before-fix) + dotfix; `check` exit 0. Staging =
+  out-full + probe + rclocal-target + root-ro-target +
+  dbus-direct (no cgroup/dance). Distro `boot` restored (system +
+  waits boot.d) + serial; serial/sshd/dhcpcd/probe in closure.
+- Live result: 92 loaded, ~15 running, STUCK_NEVERRAN=0, 0 errors.
+  Chain unlocked stepwise: rclocal-stub → 24, dbus-direct →
+  elogind/logind/avahi/cupsd/bluetoothd/NM. Key daemons all
+  Running with restarts≈0 (dbus, udevd, elogind, sshd, dhcpcd,
+  NetworkManager). dhcpcd leases 10.0.2.15 (needs udevd up).
+- Root causes nailed: (1) root-ro remount,ro always fails in VM
+  (busy) → stubbed as target (fsck already pre-PID1); (2) dbus
+  --print-address=4 fd dance incompatible + cgroup= join breaks
+  spawn — direct binary runs; notify-protocol mapping + cgroup
+  join stay in backlog; (3) `enabled=no` closure is CORRECT
+  (≈dinit lazy demand): stripping it caused wpa/mdadm/recovery
+  churn; with closure they stay disabled exactly like dinit's
+  not-loaded. dinit-ref on same image: 65 loaded, all started.
+- Open threads (resume here): (a) set-diff dinit-65 vs zinit-61
+  (dl2.txt pending inside the dinit VM log — VM was killed before
+  reading it; reboot dinit-ref and dump `dinitctl list`); (b) CI
+  verdict on 037fc35+zcore-target-fix (fmt fixed c4672a8, watch
+  for green); (c) wpa/mdadm/recovery parity (dinit: not loaded);
+  (d) packaging e2e + divergence list still untouched.
+- Ops lessons: FIFO needs a persistent holder or qemu exits on
+  stdin EOF; `background:true` launches flaked twice — setsid+&
+  +disown in short calls is reliable; never trust accumulated
+  *.log (one file per boot); guest bash histexpand eats `!` —
+  ssh for file writes, FIFO for bootstrap only.
