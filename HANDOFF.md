@@ -319,3 +319,25 @@ remaining dinitctl verbs (catlog/signal/enable/disable), per-VM
   +disown in short calls is reliable; never trust accumulated
   *.log (one file per boot); guest bash histexpand eats `!` —
   ssh for file writes, FIFO for bootstrap only.
+
+## 2026-10-14 — Artix FULL tree (92 svc) green under zinit
+
+- Merged tree (usr/lib 50 + etc 45) converts clean with 8f82fe2;
+  `check` exit 0. Seasoning: probe, rclocal-target, root-ro-target,
+  dbus-direct (no cgroup/dance), getty@tty1-5 enabled (dinit runs
+  them via agetty script; static enable = same set), distro boot +
+  serial (pulls `system` + boot.d soft set into closure).
+- Result: 20 running, rest completed/disabled, ANOMALOUS=0
+  (machine-checked: no silent-stuck, no unexpected failure).
+  Key daemons Running restarts≈0: dbus, udevd, elogind, sshd,
+  dhcpcd (leased .15), NetworkManager, bluetoothd, cronie,
+  metalog, 5 gettys. wpa/mdadm/recovery disabled-by-closure =
+  dinit's not-loaded (parity, proven on dinit-ref same image).
+- Set-diff dinit-65 vs zinit-61: only getty@tty1-5 differed
+  (fixed by enabling) + probe/rclocal (ours). Everything else
+  matches 1:1, including udevd/dbus/NetworkManager/bluetoothd.
+- dinit demand model confirmed lazy (loads on demand from boot);
+  zinit closure+bfs matches it for this tree. Remaining zinit
+  gaps filed: cgroup= join breaks spawn, notify protocol vs
+  dinit pipefd:N unmapped, convert idempotency, check-vs-sup
+  strictness on unknown deps, no type=target emission.
