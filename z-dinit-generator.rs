@@ -151,6 +151,39 @@ fn split_line(ln: &str) -> Option<(&str, &str, bool)> {
     None
 }
 
+/// Strip a dbus-style `--print-address[=FD]` token (plus one adjacent
+/// space) from a command. Only whole tokens starting at a boundary are
+/// removed, so `--no-print-address` and friends survive.
+fn strip_print_address(cmd: &str) -> String {
+    let mut o = String::with_capacity(cmd.len());
+    let mut rest = cmd;
+    while let Some(pos) = rest.find("--print-address") {
+        let before = &rest[..pos];
+        let ok_start = before.is_empty() || before.ends_with(|c| c == ' ' || c == '\t');
+        let after = &rest[pos + "--print-address".len()..];
+        let after = match after.strip_prefix('=') {
+            Some(t) => {
+                let end = t.find(|c| c == ' ' || c == '\t').unwrap_or(t.len());
+                &t[end..]
+            }
+            None => after,
+        };
+        if !ok_start || !(after.is_empty() || after.starts_with(|c| c == ' ' || c == '\t')) {
+            // Not a standalone token; keep it and move on.
+            o.push_str(&rest[..pos + "--print-address".len()]);
+            rest = after;
+            continue;
+        }
+        o.push_str(before.trim_end_matches(|c| c == ' ' || c == '\t'));
+        rest = after.trim_start_matches(|c| c == ' ' || c == '\t');
+        if !rest.is_empty() {
+            o.push(' ');
+        }
+    }
+    o.push_str(rest);
+    o
+}
+
 /// dinit value cooking (load-service.h, not the manpage): only `"..."`
 /// groups (single quotes are literal characters); `\\x` escapes;
 /// unquoted whitespace runs collapse to one space.
@@ -795,6 +828,16 @@ fn convert_one(
     if !notifyfd.is_empty() {
         if zt == "oneshot" || zt == "forking" {
             w!("pipefd needs a plain process, ignored".to_string());
+            notifyfd.clear();
+        } else if command.contains("--print-address") {
+            // dbus-style print-and-exit: the flag prints the bus address
+            // and the daemon is gone (verified: exit 0, nothing left to
+            // supervise). A supervisor cannot use that for anything, so
+            // drop the flag (and the dance, which only existed to feed
+            // it) and run the daemon foreground with no handshake.
+            command = strip_print_address(&command);
+            w!("--print-address dropped: print-and-exit cannot supervise; daemon runs foreground with ready = none".to_string());
+            ready = "none".to_string();
             notifyfd.clear();
         } else {
             pre.push_str(&format!("exec {notifyfd}>&$ZINIT_NOTIFY_FD; "));
@@ -3217,6 +3260,52 @@ mod tests {
         assert!(c.text.contains("restart-budget = 3 restarts per 10s\n"));
         assert!(c.text.contains("log = none\n"));
         assert!(c.text.contains("ready = none\n"));
+    }
+
+    #[test]
+    fn print_address_is_dropped_for_supervision() {
+        // --print-address prints and EXITS (verified exit 0 on the host:
+        // nothing left to supervise). The fd dance only existed to feed
+        // it, so both go; the daemon runs foreground with no handshake.
+        let dir = tmpout("printaddr");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /usr/lib/dinit/dbus --print-address=4\nready-notification = pipefd:4\n",
+            "dbus",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(!c.text.contains("print-address"), "got:\n{}", c.text);
+        assert!(!c.text.contains("exec 4>&"), "got:\n{}", c.text);
+        assert!(c.text.contains("ready = none\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("/usr/lib/dinit/dbus"), "got:\n{}", c.text);
+        assert!(warns.join("\n").contains("print-address"), "got: {warns:?}");
+    }
+
+    #[test]
+    fn pipefd_dance_survives_without_print_address() {
+        // A notifying daemon that does NOT print-and-exit keeps the fd
+        // dance: something must write readiness to the supervisor's pipe.
+        let dir = tmpout("pipedfd");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /usr/lib/dbus-wait-for -s -f 4 -n org.bluez /usr/lib/bluetooth/bluetoothd\nready-notification = pipefd:4\n",
+            "bluetoothd",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("exec 4>&$ZINIT_NOTIFY_FD"), "got:\n{}", c.text);
+        assert!(c.text.contains("ready = notify\n"), "got:\n{}", c.text);
     }
 
     #[test]
