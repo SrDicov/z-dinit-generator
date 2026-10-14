@@ -568,6 +568,14 @@ fn convert_one(
                         let mut names: Vec<String> = Vec::new();
                         for e in rd.flatten() {
                             if let Some(s) = e.file_name().to_str() {
+                                // Placeholders (.KEEP) and instances are not
+                                // services: the main loop skips them the same
+                                // way, and an opt:.KEEP edge is a fatal E010
+                                // downstream for nothing.
+                                if !valid_name(s) {
+                                    warns.push(format!("{n}: odd name {s} in {k}, skipped"));
+                                    continue;
+                                }
                                 names.push(s.to_string());
                             }
                         }
@@ -3203,6 +3211,25 @@ mod tests {
         assert!(c.text.contains("restart-budget = 3 restarts per 10s\n"));
         assert!(c.text.contains("log = none\n"));
         assert!(c.text.contains("ready = none\n"));
+    }
+
+    #[test]
+    fn dotfiles_in_dotd_dirs_are_skipped() {
+        // Real trees ship .KEEP placeholders (and symlinks) inside
+        // waits-for.d/depends-on.d dirs. An opt:.KEEP edge is fatal E010
+        // downstream, for a file that was never a service.
+        let src = tmpout("dotd-src");
+        let out = tmpout("dotd-out");
+        let dd = src.join("boot.d");
+        std::fs::create_dir_all(&dd).unwrap();
+        std::fs::write(dd.join(".KEEP"), "").unwrap();
+        std::fs::write(dd.join("svc"), "type = process\ncommand = /bin/s\n").unwrap();
+        std::fs::write(src.join("svc"), "type = process\ncommand = /bin/s\n").unwrap();
+        std::fs::write(src.join("boot"), "type = internal\nwaits-for.d = boot.d\n").unwrap();
+        assert_eq!(cmd_convert(&src, &out), 0);
+        let got = std::fs::read_to_string(out.join("boot.conf")).unwrap();
+        assert!(!got.contains(".KEEP"), "placeholder must not leak:\n{got}");
+        assert!(got.contains("opt:svc"), "real member stays:\n{got}");
     }
 
     #[test]
