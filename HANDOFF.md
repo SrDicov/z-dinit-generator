@@ -225,11 +225,15 @@ twice; FIFO never failed). `-hostfwd=tcp::2225-:22`.
   re-converting, then re-apply seasoning. This explained the "v0.0.2
   boot quirk" (net/probe never auto-started): my own stale files,
   not a supervisor bug. GENERATOR BACKLOG: idempotent convert.
-- Status at pause: VM boots to `login:`, root console OK, `zctl
-  list` = boot/net/probe stopped + serial/sshd running,
-  PROBE_DONE at boot, sshd stable restarts=0/3. NOT yet proven:
-  ssh into 2225 (dhcpcd=running but no IP line captured),
-  verb battery, shutdown cascade. Musa note: Chimera runs frozen
+- Closed 2026-10-13: static net.sh oneshot (dhcpcd needs carrier-up
+  ordering/udev, unsuitable headless — one line, moving on), all 5
+  auto-start at boot, ssh into 2225 OK, `zctl`
+  kick/reload-all/restart + `kill -9`-rearme pattern inherited from
+  Void, 0 zombies, TERM-to-sup stops everything, stays down, no
+  relaunch (exactly one `supervising` line; v0.0.2 prints no
+  announce line — cosmetic, proven present on current source in the
+  Void leg). Full-trace gotchas (loader `]`, dep.bin, PATH, api-fs
+  --move) all baked into `mkinitramfs-chimera.sh`. Musa note: Chimera runs frozen
   v0.0.2 musl like Alpine (orphan fix pending musl release).
 - Deferred deliberately: full 61-service tree in VM (CI chimera-e2e
   covers convert+container); early-env (needs dinitctl shim =
