@@ -239,3 +239,51 @@ twice; FIFO never failed). `-hostfwd=tcp::2225-:22`.
   covers convert+container); early-env (needs dinitctl shim =
   glibc, won't run on musl — same constraint as Alpine compatd)
   and root-rw mounts belong to that full-tree effort.
+
+## 2026-10-13/14 — Artix leg CLOSED. MATRIX 4/4 COMPLETE (minimal plans)
+
+Recipe: kernel `iso-artix/boot/vmlinuz-x86_64` (7.1.8-artix1), NO
+initramfs (virtio_blk/pci+ext4 built-in; virtio_net is a module →
+`modprobe virtio_net` in `zinit-init` wrapper, pre-supervisor),
+`root=/dev/vda rw console=ttyS0,115200 init=/sbin/zinit-init`,
+`-nographic < qemu-in` FIFO console, `-hostfwd=tcp::2226-:22`.
+4G image (2.1G rootfs + ext4 overhead exceeds the 2G default;
+a stale loop-mount from a failed mkdisk must be umounted by hand
+before retrying).
+
+- Full-tree convert (42 files) works with the e577fc4 before-mirror
+  fix (logind E010 gone); `check` green modulo W003. Curated plan:
+  boot/serial/sshd/dhcpcd/probe + live-added compatd (+static net
+  oneshot; dhcpcd kept running harmlessly).
+- Seasoning: root unlocked, host keys via ssh-keygen -A (needs
+  cage-artix/dev/null touched first as bind target), empty-password
+  sshd_config.d, serial=agetty ttyS0, sshd=distro `-D` + run/sshd
+  mkdir, zinit/zctl glibc FRESH (714148f, orphan fix included),
+  probe script, compatd live-deployed (no rebuild).
+- Results: login+root shell, PID1=zinit, ssh OK, probe PROBE_DONE
+  at boot, 0 zombies, dinitctl list/status/is-started/restart +
+  zctl kick/reload-all green over the real v7 socket, TERM-to-sup
+  cascade with FULL announce line, stays down, no relaunch.
+- Gotchas: `ip=`/`rd.neednet` N/A (no initramfs); dhcpcd blind
+  without udevd (same as Chimera — static chosen); guest bash has
+  histexpand ON — multi-line FIFO writes with `!` die with "event
+  not found", and `set +H` must travel on its OWN line; prefer
+  ssh (non-interactive, no expansion) for all file writes once it
+  exists; FIFO only for pre-ssh bootstrap. `head -n 1` can print
+  empty on a broken-shebang file — verify with cat -A.
+- Generator fix this leg (e577fc4, CI green): before-mirror yields
+  to an existing required edge (was: fatal E010 on Artix logind).
+  Backlog filed by observation: convert not idempotent (appends
+  enabled=no; never overwrites generated files either — always rm
+  + reconvert + re-season), `check` does not flag unknown required
+  deps while sup fatals on them (NetworkManager/dhcpcd
+  pre-network.target), no static detector for daemonizing commands
+  (Void -D saga), no `type=target` emission for dinit .targets.
+
+MATRIX STATE: Alpine closed, Void closed (ref+dinit+zinit+compatd),
+Chimera closed (5svc, ssh, verbs, shutdown), Artix closed (6svc,
+ssh, compatd verbs, shutdown). All on testing, all pushed.
+Deliberately open: full 61-svc Chimera tree in VM (CI container
+covers it), divergence classification list, packaging e2e installs,
+remaining dinitctl verbs (catlog/signal/enable/disable), per-VM
+15-min soaks (only Alpine did the full soak).
