@@ -1037,54 +1037,74 @@ fn convert_one(
 }
 
 fn cmd_convert(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
-    if !in_dir.is_dir() {
-        warn(&format!("{}: not a directory", in_dir.display()));
-        return 1;
+    cmd_convert_dirs(std::slice::from_ref(&in_dir.to_path_buf()), out_dir)
+}
+
+/// Convert several dinit dirs into one output with a single shared
+/// dependency graph: later dirs override earlier files by name (dinit
+/// layering: /etc wins over /usr/lib), and the before-inversion and the
+/// boot closure run ONCE over the union. Per-dir converts had split-brain
+/// state — each pass disabled whatever its own partial graph could not
+/// reach, so the second pass froze services the first had enabled
+/// (tmpfiles-setup and friends stayed down and the boot stalled).
+fn cmd_convert_dirs(dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i32 {
+    for d in dirs {
+        if !d.is_dir() {
+            warn(&format!("{}: not a directory", d.display()));
+            return 1;
+        }
     }
     if std::fs::create_dir_all(out_dir).is_err() {
         warn("cannot create outdir");
         return 1;
     }
-    let mut names: Vec<String> = Vec::new();
-    let rd = match std::fs::read_dir(in_dir) {
-        Ok(r) => r,
-        Err(_) => {
-            warn("cannot read indir");
-            return 1;
-        }
-    };
-    for e in rd.flatten() {
-        let ft = match e.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if !ft.is_file() {
-            continue;
-        }
-        if let Some(s) = e.file_name().to_str() {
-            names.push(s.to_string());
-        }
-    }
-    names.sort();
     let mut pulls: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut befores: Vec<(String, String)> = Vec::new();
     let mut converted: Vec<Converted> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
-    for n in &names {
-        if !valid_name(n) {
-            warns.push(format!("{n}: odd name, skipped"));
-            continue;
-        }
-        let text = match std::fs::read_to_string(in_dir.join(n)) {
-            Ok(t) => t,
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    // Reversed so the later (higher-precedence) dir wins each name.
+    for in_dir in dirs.iter().rev() {
+        let mut names: Vec<String> = Vec::new();
+        let rd = match std::fs::read_dir(in_dir) {
+            Ok(r) => r,
             Err(_) => {
-                warns.push(format!("{n}: cannot read, skipped"));
-                continue;
+                warn(&format!("cannot read {}", in_dir.display()));
+                return 1;
             }
         };
-        match convert_one(&text, n, in_dir, &mut pulls, &mut befores, &mut warns) {
-            Some(c) => converted.push(c),
-            None => {}
+        for e in rd.flatten() {
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !ft.is_file() {
+                continue;
+            }
+            if let Some(s) = e.file_name().to_str() {
+                names.push(s.to_string());
+            }
+        }
+        names.sort();
+        for n in &names {
+            if !valid_name(n) {
+                warns.push(format!("{n}: odd name, skipped"));
+                continue;
+            }
+            if !done.insert(n.clone()) {
+                continue;
+            }
+            let text = match std::fs::read_to_string(in_dir.join(n)) {
+                Ok(t) => t,
+                Err(_) => {
+                    warns.push(format!("{n}: cannot read, skipped"));
+                    continue;
+                }
+            };
+            match convert_one(&text, n, in_dir, &mut pulls, &mut befores, &mut warns) {
+                Some(c) => converted.push(c),
+                None => {}
+            }
         }
     }
     // write converted
@@ -1150,8 +1170,9 @@ fn cmd_convert(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
             return 1;
         }
     }
-    // boot closure: BFS from boot over recorded pulls
-    if in_dir.join("boot").is_file() {
+    // boot closure: BFS from boot over recorded pulls. Any converted
+    // boot counts, whatever layer it came from.
+    if converted.iter().any(|c| c.name == "boot") {
         let mut closed: BTreeSet<String> = BTreeSet::new();
         let mut work: Vec<String> = vec!["boot".to_string()];
         let mut wi = 0;
@@ -3057,12 +3078,10 @@ fn cmd_start(out: Option<&str>) -> i32 {
         warn("no dinit dirs (/usr/lib/dinit.d, /etc/dinit.d)");
         return 1;
     }
-    // usr first so etc wins on overlay.
-    for d in &found {
-        let rc = cmd_convert(d, &outp);
-        if rc != 0 {
-            return 1;
-        }
+    // usr first so etc wins on overlay; one shared graph, so the
+    // closure sees every edge no matter which layer it lives on.
+    if cmd_convert_dirs(&found, &outp) != 0 {
+        return 1;
     }
     // compatd service so devmon-speaking helpers keep working.
     let exe = std::env::current_exe()
@@ -3327,6 +3346,47 @@ mod tests {
         let got = std::fs::read_to_string(out.join("boot.conf")).unwrap();
         assert!(!got.contains(".KEEP"), "placeholder must not leak:\n{got}");
         assert!(got.contains("opt:svc"), "real member stays:\n{got}");
+    }
+
+    #[test]
+    fn layered_dirs_overlay_etc_over_usr() {
+        // Later dirs win by name (dinit layering); the shadowed file
+        // contributes nothing, not even its pulls.
+        let usr = tmpout("layer-usr");
+        let etc = tmpout("layer-etc");
+        let out = tmpout("layer-out");
+        std::fs::write(usr.join("a"), "type = process\ncommand = /bin/usr-a\n").unwrap();
+        std::fs::write(usr.join("b"), "type = process\ncommand = /bin/usr-b\n").unwrap();
+        std::fs::write(etc.join("a"), "type = process\ncommand = /bin/etc-a\n").unwrap();
+        let dirs = vec![usr, etc];
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        let got = std::fs::read_to_string(out.join("a.conf")).unwrap();
+        assert!(got.contains("command = /bin/etc-a\n"), "etc wins:\n{got}");
+        assert!(std::fs::read_to_string(out.join("b.conf")).is_ok());
+    }
+
+    #[test]
+    fn closure_spans_layers() {
+        // The case that froze real boots: boot (etc) requires mid, mid
+        // (usr) requires lib. Per-dir converts never see the whole chain
+        // and disable lib; one shared graph must keep it enabled.
+        let usr = tmpout("span-usr");
+        let etc = tmpout("span-etc");
+        let out = tmpout("span-out");
+        std::fs::write(usr.join("lib"), "type = process\ncommand = /bin/lib\n").unwrap();
+        std::fs::write(usr.join("mid"), "type = process\ncommand = /bin/mid\ndepends-on = lib\n")
+            .unwrap();
+        std::fs::write(etc.join("boot"), "type = internal\ndepends-on = mid\n").unwrap();
+        let dirs = vec![usr, etc];
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        for svc in ["boot", "mid", "lib"] {
+            let got =
+                std::fs::read_to_string(out.join(format!("{svc}.conf"))).unwrap();
+            assert!(
+                !got.contains("enabled = no"),
+                "{svc} is boot-reachable and must stay enabled:\n{got}"
+            );
+        }
     }
 
     #[test]
