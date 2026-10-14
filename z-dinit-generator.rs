@@ -1148,15 +1148,21 @@ fn cmd_convert(in_dir: &std::path::Path, out_dir: &std::path::Path) -> i32 {
             if !closed.contains(&svc) {
                 let p = out_dir.join(&fname);
                 let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
-                if !cur.ends_with('\n') && !cur.is_empty() {
-                    cur.push('\n');
-                }
-                cur.push_str("enabled = no\n");
-                if std::fs::write(&p, cur).is_err() {
-                    for m in &warns {
-                        warn(m);
+                // Idempotent: re-running convert (or `start`) over its own
+                // output must not stack another `enabled = no` — a duplicate
+                // directive is fatal E005 at load and bricks the boot.
+                let has = cur.lines().any(|l| l.trim() == "enabled = no");
+                if !has {
+                    if !cur.ends_with('\n') && !cur.is_empty() {
+                        cur.push('\n');
                     }
-                    return 1;
+                    cur.push_str("enabled = no\n");
+                    if std::fs::write(&p, cur).is_err() {
+                        for m in &warns {
+                            warn(m);
+                        }
+                        return 1;
+                    }
                 }
             }
         }
@@ -3230,6 +3236,26 @@ mod tests {
         let got = std::fs::read_to_string(out.join("boot.conf")).unwrap();
         assert!(!got.contains(".KEEP"), "placeholder must not leak:\n{got}");
         assert!(got.contains("opt:svc"), "real member stays:\n{got}");
+    }
+
+    #[test]
+    fn enabled_no_is_idempotent_across_runs() {
+        // `start` re-runs convert over its own output (the services dir
+        // already holds enabled=no files). Stacking another copy is a
+        // fatal E005 duplicate that bricks the next boot — convert must
+        // be a fixed point.
+        let src = tmpout("idem-src");
+        let out = tmpout("idem-out");
+        std::fs::write(src.join("boot"), "type = internal\n").unwrap();
+        std::fs::write(src.join("lonely"), "type = process\ncommand = /bin/s\n").unwrap();
+        assert_eq!(cmd_convert(&src, &out), 0);
+        assert_eq!(cmd_convert(&src, &out), 0);
+        let got = std::fs::read_to_string(out.join("lonely.conf")).unwrap();
+        assert_eq!(
+            got.lines().filter(|l| l.trim() == "enabled = no").count(),
+            1,
+            "exactly one enabled line after two runs:\n{got}"
+        );
     }
 
     #[test]
