@@ -496,3 +496,31 @@ sshd/ssh working for tomorrow. The race is now the #1 Artix
 blocker: `opt:` edges neither order nor block, so the early wave
 runs fully concurrent; dinit serializes it via after/waits-for.
 Missing primitive: order-only edges (design work, not a patch).
+
+## 2026-10-15 — order-only `after:` lands, sysusers race closed
+
+Root cause, proven: `root-ro` remounts `/` ro early, `early-root-rw`
+remounts rw later (same dance as dinit), but with every ordering
+edge mapped to `opt:` the whole tree spawned at t=0 into the ro
+window and died at log-open (EROFS, pre-exec). Each failed spawn
+eats budget, so `restart = never` services never retried and gated
+their subtree 4/4 cold boots. A 60s sleep changed nothing (spawn
+dies before exec); 20/20 manual runs pass.
+Fix (zinit 428d6dd + fixes, generator 30795f3): `depends = after:x`
+holds spawn until x's first attempt (started/completed/failed/
+suppressed/disabled all release) without gating on outcome.
+`after`/`waits-for`/before-mirror all emit `after:`; closure
+unchanged (waits still pull, after/before never do); after-cycles
+fatal at load like required ones; dangling after warns (W102).
+CI fallout fixed along the way: parser E010 fired on fresh
+required entries, clippy err_expect, rustfmt; e2e now consumes
+CI-green testing artifacts (glibc host check, musl container
+boot/check — check runs in-container because user= only resolves
+where the packages are) until the next release re-pins a version;
+musl artifact now ships zctl too. dinit-import.sh + proto test
+moved to `after:` with the Rust side (parity kept).
+Validated live (proof14): sysusers/local/pre-network completed at
+boot, sshd+dhcpcd running, 17 running, ANOM=0, SSH ok — zero
+interventions. Deploy note: new confs brick old sups (E008), so
+ship binary+staging together and reboot (ETXTBSY: install the
+running sup via rename, never direct overwrite).
