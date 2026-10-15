@@ -486,3 +486,13 @@ hand. Fix verified live: DEPLOY_OK, watch restarted to the new
 image, `touch` on a dinit file refires (`reloaded`, unprompted)
 with the chain intact (udevd/tmpfiles/sysusers/pre-local all stay
 enabled). The 00:18 mtime dust was my own sed + old-watch writes.
+
+## 2026-10-15 — proof9: sysusers race 3/3, VM left healthy
+
+Fresh cold boot with the fixed watch live: staging intact, but
+`sysusers` suppressed at boot again (3/3) and the network subtree
+gated. `kick` recovered everything (sshd running). VM left up with
+sshd/ssh working for tomorrow. The race is now the #1 Artix
+blocker: `opt:` edges neither order nor block, so the early wave
+runs fully concurrent; dinit serializes it via after/waits-for.
+Missing primitive: order-only edges (design work, not a patch).
