@@ -3028,10 +3028,12 @@ fn cmd_watch(in_dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i32 {
     let sock = zinit_socket(None);
     let mut last = fingerprints(in_dirs);
     // initial convert so the daemon is the source of truth from second zero.
-    for d in in_dirs {
-        if cmd_convert(d, out_dir) != 0 {
-            return 1;
-        }
+    // One shared graph, never per-dir: a layered pass with its own partial
+    // pulls disables whatever it cannot reach (etc has its own boot, so a
+    // solo etc pass decimates udevd/tmpfiles/sysusers and every seasoning
+    // file). That exact decimation froze an Artix cold boot to 3 services.
+    if cmd_convert_dirs(in_dirs, out_dir) != 0 {
+        return 1;
     }
     c4_reload(&sock);
     loop {
@@ -3039,13 +3041,7 @@ fn cmd_watch(in_dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i32 {
         let cur = fingerprints(in_dirs);
         if cur != last {
             last = cur;
-            let mut ok = true;
-            for d in in_dirs {
-                if cmd_convert(d, out_dir) != 0 {
-                    ok = false;
-                }
-            }
-            if ok {
+            if cmd_convert_dirs(in_dirs, out_dir) == 0 {
                 c4_reload(&sock);
             }
         }
@@ -3385,6 +3381,33 @@ mod tests {
             assert!(
                 !got.contains("enabled = no"),
                 "{svc} is boot-reachable and must stay enabled:\n{got}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconvert_keeps_cross_layer_closure() {
+        // The watch daemon re-converts on every change; a re-run must not
+        // decimate what the first run closed (an Artix cold boot froze to
+        // 3 services when the etc-only pass disabled udevd/tmpfiles and
+        // every seasoning file).
+        let usr = tmpout("re-usr");
+        let etc = tmpout("re-etc");
+        let out = tmpout("re-out");
+        std::fs::write(usr.join("lib"), "type = process\ncommand = /bin/lib\n").unwrap();
+        std::fs::write(usr.join("mid"), "type = process\ncommand = /bin/mid\ndepends-on = lib\n")
+            .unwrap();
+        std::fs::write(etc.join("boot"), "type = internal\ndepends-on = mid\n").unwrap();
+        std::fs::write(etc.join("boot-extra"), "type = process\ncommand = /bin/x\n").unwrap();
+        let dirs = vec![usr, etc];
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        for svc in ["boot", "mid", "lib"] {
+            let got =
+                std::fs::read_to_string(out.join(format!("{svc}.conf"))).unwrap();
+            assert!(
+                !got.contains("enabled = no"),
+                "{svc} must survive reconversion:\n{got}"
             );
         }
     }
