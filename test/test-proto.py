@@ -213,7 +213,7 @@ try:
     c2.raw(bytes([11, 2]) + struct.pack("<II", fa, fb))
     check("add-dep", c2.read(1) == bytes([50]))
     with open(os.path.join(OUT, "a.conf")) as f:
-        check("add-file", "depends = opt:b" in f.read())
+        check("add-file", "depends = after:b" in f.read())
     c2.raw(bytes([29, 2]) + struct.pack("<II", fa, fb))
     v7 = c2.read(32)
     check("enable-v7", v7[0] == 70 and v7[1] == 1 and len(v7) == 32, repr(v7))

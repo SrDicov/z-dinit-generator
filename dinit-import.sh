@@ -6,7 +6,7 @@
 # waits + .d; after/before nunca arrastran) arranca solo; el resto sale
 # con `enabled = no` para arranque explícito del operador.
 # depends-on/ms=>required (ms pierde el corte post-arranque);
-# waits-for/after=>opt: (ordena sin bloquear); before X=>opt: en X;
+# waits-for/after=>after: (ordena sin bloquear); before X=>after: en X;
 # bgprocess sin pid=>process; internal/triggered=>oneshot true (E011);
 # ready-notification=>notify+preambulo fd, sin ella=>none (dinit
 # arranca en exec; el defecto notify colaria 30 s por demonio);
@@ -46,11 +46,11 @@ convert() {
             type) type=$v;;
             command) if [ "$ap" = 1 ]; then command="$command $v"; else command=$v; fi;;
             depends-on|depends-ms) deps=${deps:+"$deps, "}$v; pull "$n" "$v" || return 1;;
-            waits-for) deps=${deps:+"$deps, "}opt:$v; pull "$n" "$v" || return 1;;
-            after) deps=${deps:+"$deps, "}opt:$v;;
-            before) printf '%s %s\n' "$v" "opt:$n" >>"$bef" || return 1;;
+            waits-for) deps=${deps:+"$deps, "}after:$v; pull "$n" "$v" || return 1;;
+            after) deps=${deps:+"$deps, "}after:$v;;
+            before) printf '%s %s\n' "$v" "after:$n" >>"$bef" || return 1;;
             depends-on.d|depends-ms.d|waits-for.d)
-                case "$k" in depends-on.d) pre=;; *) pre=opt:;; esac
+                case "$k" in depends-on.d) pre=;; *) pre=after:;; esac
                 dd=$v; bn=$(basename "$dd")
                 if [ -d "$in/$bn" ]; then dd=$in/$bn; fi
                 if [ -d "$dd" ]; then for e in "$dd"/*; do

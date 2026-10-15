@@ -6,9 +6,11 @@ jobs:
     timeout-minutes: 15
     env:
       PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
-      ZINIT_VER: v0.0.2
-      ZINIT_TGZ: zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
-      ZINIT_DIR: zinit-v0.0.2-x86_64-unknown-linux-musl
+      # after: syntax needs a post-v0.0.2 sup: consume the latest CI-green
+      # testing artifacts (glibc for host-side check, musl for the container
+      # boot) until the next release re-pins a version.
+      ZINIT_GLIBC: zinit-linux-x86_64-glibc
+      ZINIT_MUSL: zinit-musl-x86_64
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -29,16 +31,18 @@ jobs:
           sort warn.log | uniq -c | sort -rn | head -20
       - name: c1
         run: |
-          gh release download "$ZINIT_VER" -R SrDicov/zinit --pattern '*x86_64*'
-          tar xzf "$ZINIT_TGZ"
-          docker run --rm -e PKGS -e ZINIT_DIR -v "$PWD:/work" chimeralinux/chimera:latest \
-            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && /work/$ZINIT_DIR/zinit check /work/out && exec /work/$ZINIT_DIR/zinit check /work/out-rs'
+          ZRUN=$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')
+          test -n "$ZRUN" || { echo NO_GREEN_ZINIT; exit 1; }
+          gh run download "$ZRUN" -R SrDicov/zinit --name "$ZINIT_GLIBC" --dir zfresh
+          gh run download "$ZRUN" -R SrDicov/zinit --name "$ZINIT_MUSL" --dir zmusl
+          ./zfresh/zinit check out
+          ./zfresh/zinit check out-rs
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
         run: |
           rm -rf payload && mkdir payload
-          cp "$ZINIT_DIR/zinit" "$ZINIT_DIR/zctl" payload/
+          cp zmusl/zinit zmusl/zctl payload/
           cp z-dinit-generator.rs payload/
           cp -r out payload/out
           printf 'type = process\ncommand = /z/z-dinit-generator compatd\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n' > payload/out/compatd.conf

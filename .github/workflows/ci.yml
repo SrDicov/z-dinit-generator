@@ -126,9 +126,12 @@ jobs:
           ! grep -q '^enabled' out/boot.conf
       - name: c1
         run: |
-          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*'
-          tar xzf zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
-          zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check out
+          # after: syntax needs a post-v0.0.2 sup: consume the latest
+          # CI-green testing artifact until the next release re-pins a version.
+          ZRUN=$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')
+          test -n "$ZRUN" || { echo NO_GREEN_ZINIT; exit 1; }
+          gh run download "$ZRUN" -R SrDicov/zinit --name zinit-linux-x86_64-glibc --dir zfresh
+          ./zfresh/zinit check out
         env:
           GH_TOKEN: ${{ github.token }}
   keys:
@@ -164,12 +167,10 @@ jobs:
           grep -qF 'export READY_FD="$ZINIT_NOTIFY_FD"' kout/notifier.conf || { echo "MISS: export READY_FD="$ZINIT_NOTIFY_FD" in kout/notifier.conf"; exit 1; }
           grep -q '^ready = notify$' kout/notifier.conf || { echo "MISS: ^ready = notify$ in kout/notifier.conf"; exit 1; }
           grep -q '^env = DINIT_SERVICE=svc$' kout/svc.conf || { echo "MISS: ^env = DINIT_SERVICE=svc$ in kout/svc.conf"; exit 1; }
-          gh release download v0.0.2 -R SrDicov/zinit --pattern '*x86_64*' || { echo DOWNLOAD_FAILED; exit 1; }
-          ls -la ./*.tar.gz
-          tar xzf zinit-v0.0.2-x86_64-unknown-linux-musl.tar.gz
+          gh run download "$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')" -R SrDicov/zinit --name zinit-linux-x86_64-glibc --dir zfresh || { echo DOWNLOAD_FAILED; exit 1; }
           echo "--- svc.conf ---"
           cat kout/svc.conf
           echo "--- check ---"
-          zinit-v0.0.2-x86_64-unknown-linux-musl/zinit check kout
+          ./zfresh/zinit check kout
         env:
           GH_TOKEN: ${{ github.token }}
