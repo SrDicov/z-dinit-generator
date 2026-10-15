@@ -7,9 +7,9 @@ jobs:
     env:
       PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
       # after: syntax needs a post-v0.0.2 sup: consume the latest CI-green
-      # testing artifacts (glibc for host-side check, musl for the container
-      # boot) until the next release re-pins a version.
-      ZINIT_GLIBC: zinit-linux-x86_64-glibc
+      # testing musl artifact until the next release re-pins a version.
+      # check runs inside the container because user= names only resolve
+      # where the packages installed them.
       ZINIT_MUSL: zinit-musl-x86_64
     steps:
       - uses: actions/checkout@v5
@@ -33,10 +33,9 @@ jobs:
         run: |
           ZRUN=$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')
           test -n "$ZRUN" || { echo NO_GREEN_ZINIT; exit 1; }
-          gh run download "$ZRUN" -R SrDicov/zinit --name "$ZINIT_GLIBC" --dir zfresh
           gh run download "$ZRUN" -R SrDicov/zinit --name "$ZINIT_MUSL" --dir zmusl
-          ./zfresh/zinit check out
-          ./zfresh/zinit check out-rs
+          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && /work/zmusl/zinit check /work/out && exec /work/zmusl/zinit check /work/out-rs'
         env:
           GH_TOKEN: ${{ github.token }}
       - name: boot
