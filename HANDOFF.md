@@ -469,3 +469,20 @@ zinit PID 1. dbus runs from boot with no manual cgroup strip.
 - TERM-to-sup re-proven: 0 running + `no poweroff path, stays up
   and idle` announce. Note: the serial shell dies with the cascade,
   so FIFO goes dead too — recovery is relaunch, not re-login.
+
+## 2026-10-15 — phantom writer caught: silent curl + old watch (no bug)
+
+The proof4→proof5 "decimation" (70 enabled=no, 3 fresh mtimes) was
+not nondeterminism: the guest never received the c3b64c4 binary.
+`curl -s` failed silently (no route: manual IP lost on reboot,
+dhcpcd gated) and the `;` before `/sbin/zdg start` ran the OLD
+binary anyway. md5 proved it (guest 8aeb102e vs fixed 30478396…).
+So the running watch was the pre-fix per-dir decimator, refiring on
+real live mutations of the dinit dirs (7 spontaneous `reloaded:`
+in proof4 — artix-live/userspawn-class tooling touches them).
+Lessons: deploy with `&&`-chains + md5 assert, never `;`; give the
+guest a persistent IP (seasoning) instead of per-session `ip` by
+hand. Fix verified live: DEPLOY_OK, watch restarted to the new
+image, `touch` on a dinit file refires (`reloaded`, unprompted)
+with the chain intact (udevd/tmpfiles/sysusers/pre-local all stay
+enabled). The 00:18 mtime dust was my own sed + old-watch writes.
