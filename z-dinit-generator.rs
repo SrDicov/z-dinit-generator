@@ -184,6 +184,33 @@ fn strip_print_address(cmd: &str) -> String {
     o
 }
 
+/// Strip a bare `--dinit` token (plus one adjacent space) from a command.
+/// dinit's dbus patch uses it for socket activation from PID 1; under
+/// supervision nobody passes the socket, so the daemon waits on an
+/// activation that never comes (verified live: no bus socket, dinit-dbus
+/// hangs). Only whole tokens go, so longer flags survive.
+fn strip_dinit_flag(cmd: &str) -> String {
+    let mut o = String::with_capacity(cmd.len());
+    let mut rest = cmd;
+    while let Some(pos) = rest.find("--dinit") {
+        let before = &rest[..pos];
+        let ok_start = before.is_empty() || before.ends_with(|c| c == ' ' || c == '\t');
+        let after = &rest[pos + "--dinit".len()..];
+        if !ok_start || !(after.is_empty() || after.starts_with(|c| c == ' ' || c == '\t')) {
+            o.push_str(&rest[..pos + "--dinit".len()]);
+            rest = after;
+            continue;
+        }
+        o.push_str(before.trim_end_matches(|c| c == ' ' || c == '\t'));
+        rest = after.trim_start_matches(|c| c == ' ' || c == '\t');
+        if !o.is_empty() && !rest.is_empty() {
+            o.push(' ');
+        }
+    }
+    o.push_str(rest);
+    o
+}
+
 /// dinit value cooking (load-service.h, not the manpage): only `"..."`
 /// groups (single quotes are literal characters); `\\x` escapes;
 /// unquoted whitespace runs collapse to one space.
@@ -849,6 +876,25 @@ fn convert_one(
             notifyvar.clear();
         } else {
             pre.push_str(&format!("export {notifyvar}=\"$ZINIT_NOTIFY_FD\"; "));
+        }
+    }
+    // dinit activation never comes under supervision: a dinit-patched
+    // daemon waiting on it (dbus-daemon --dinit) binds nothing and hangs
+    // its whole subtree (verified live: empty /run/dbus, dinit-dbus
+    // stuck). Strip from both command twins, before quote selection.
+    {
+        let mut dropped = false;
+        for twin in [&mut command, &mut command_raw] {
+            if twin.contains("--dinit") {
+                let stripped = strip_dinit_flag(twin);
+                if stripped != *twin {
+                    *twin = stripped;
+                    dropped = true;
+                }
+            }
+        }
+        if dropped {
+            w!("--dinit dropped: no dinit activation under supervision; daemon binds itself".to_string());
         }
     }
     let mut stunt = String::new();
@@ -3501,6 +3547,41 @@ mod tests {
             "soft mirror must not duplicate the required edge:\n{got}"
         );
         assert!(got.contains("elogind"), "required edge stays:\n{got}");
+    }
+
+    #[test]
+    fn dinit_flag_is_dropped_for_supervision() {
+        // dinit-patched daemons wait on PID-1 activation that never
+        // comes (verified: dbus-daemon --dinit binds nothing); the
+        // supervisor runs them plain so they bind themselves.
+        assert_eq!(
+            strip_dinit_flag("/usr/bin/dbus-daemon --system --dinit --nofork"),
+            "/usr/bin/dbus-daemon --system --nofork"
+        );
+        assert_eq!(strip_dinit_flag("--dinit /bin/x"), "/bin/x");
+        assert_eq!(strip_dinit_flag("/bin/x --dinit"), "/bin/x");
+        // Longer flags survive.
+        assert_eq!(strip_dinit_flag("/bin/x --dinitfoo"), "/bin/x --dinitfoo");
+        let src = tmpout("dinit-src");
+        let out = tmpout("dinit-out");
+        std::fs::write(
+            src.join("svc"),
+            "type = process\ncommand = /bin/d --dinit\n",
+        )
+        .unwrap();
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let text = std::fs::read_to_string(src.join("svc")).unwrap();
+        let c = convert_one(&text, "svc", &src, &mut pulls, &mut befores, &mut warns)
+            .expect("converts");
+        assert!(!c.text.contains("--dinit"), "flag must go:\n{}", c.text);
+        assert!(c.text.contains("command = /bin/d\n"), "got:\n{}", c.text);
+        assert!(
+            warns.join("\n").contains("--dinit dropped"),
+            "loud warn expected"
+        );
+        let _ = out;
     }
 
     #[test]
