@@ -525,6 +525,18 @@ interventions. Deploy note: new confs brick old sups (E008), so
 ship binary+staging together and reboot (ETXTBSY: install the
 running sup via rename, never direct overwrite).
 
+## 2026-10-15 — proof18: remount race + cgroup join both closed live
+
+New sup (oneshot-completion gate + NUL fix + step announce) with
+regenerated staging, zero interventions from cold boot: sysusers
+completed (waits early-root-rw's *completion*, not its start —
+releasing on Starting raced the mount syscall itself), dbus running
+first try WITH `cgroup = dbus.sv` (restarts 0/3), process confirmed
+in `0::/zinit.slice/dbus.sv`. 17 running, ANOM=0, SSH ok.
+Refinement on the way in: failed/suppressed/disabled always release
+(no hangs, waiter rides alongside retries); mixed required+after
+loops are load-fatal like pure cycles. Both repos all-green.
+
 ## 2026-10-15 — cgroup join root cause: NUL padding (found by reading)
 
 Every `cgroup =` service died pre-exec (exit 127) while manual joins
