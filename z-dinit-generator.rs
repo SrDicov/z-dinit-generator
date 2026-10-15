@@ -573,7 +573,7 @@ fn convert_one(
                 if !deps.is_empty() {
                     deps.push_str(", ");
                 }
-                deps.push_str("opt:");
+                deps.push_str("after:");
                 deps.push_str(&v);
                 pulls.entry(n.to_string()).or_default().push(v);
             }
@@ -581,12 +581,12 @@ fn convert_one(
                 if !deps.is_empty() {
                     deps.push_str(", ");
                 }
-                deps.push_str("opt:");
+                deps.push_str("after:");
                 deps.push_str(&v);
             }
-            "before" => befores.push((v, format!("opt:{n}"))),
+            "before" => befores.push((v, format!("after:{n}"))),
             "depends-on.d" | "depends-ms.d" | "waits-for.d" => {
-                let pre = if k == "depends-on.d" { "" } else { "opt:" };
+                let pre = if k == "depends-on.d" { "" } else { "after:" };
                 let dd = v.clone();
                 let bn = dd.rsplit('/').next().unwrap_or(&dd).to_string();
                 let cand_in = in_dir.join(&bn);
@@ -1136,17 +1136,23 @@ fn cmd_convert_dirs(dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i
         };
         let mut out = String::new();
         let mut hit = false;
-        // The mirror target: `a` is `opt:X` (soft ordering). If X is
-        // already listed — required or soft — adding it again either
-        // duplicates it or, worse, pairs `opt:X` with `X`, which zinit
-        // rejects (E010). A required edge already orders the pair, so
-        // skipping loses nothing.
-        let want = a.strip_prefix("opt:").unwrap_or(a.as_str());
+        // The mirror target: `a` is `after:X` (order-only). If X is
+        // already listed — required, soft, or order-only — adding it
+        // again either duplicates it or, worse, pairs `after:X` with `X`
+        // or `opt:X`, which zinit rejects (E010). A required edge already
+        // orders the pair, so skipping loses nothing.
+        let want = a
+            .strip_prefix("after:")
+            .or_else(|| a.strip_prefix("opt:"))
+            .unwrap_or(a.as_str());
         for l in cur.lines() {
             if l.starts_with("depends = ") {
                 let have = l["depends = ".len()..].split(',').any(|e| {
                     let e = e.trim();
-                    e.strip_prefix("opt:").unwrap_or(e) == want
+                    e.strip_prefix("after:")
+                        .or_else(|| e.strip_prefix("opt:"))
+                        .unwrap_or(e)
+                        == want
                 });
                 if have {
                     out.push_str(l);
@@ -2252,7 +2258,11 @@ fn would_cycle(outdir: &std::path::Path, from: &str, to: &str) -> bool {
         let base = n.split('@').next().unwrap_or(&n).to_string();
         if let Some(ds) = read_depends(outdir, &base) {
             for d in ds {
-                let target = d.strip_prefix("opt:").unwrap_or(&d).to_string();
+                let target = d
+                    .strip_prefix("opt:")
+                    .or_else(|| d.strip_prefix("after:"))
+                    .unwrap_or(&d)
+                    .to_string();
                 if !seen.contains_key(&target) {
                     work.push(target);
                 }
@@ -2264,10 +2274,11 @@ fn would_cycle(outdir: &std::path::Path, from: &str, to: &str) -> bool {
 
 fn dep_token(dtype: u8, to: &str) -> Option<String> {
     // REGULAR 0 and MILESTONE 3 are both hard (milestone only softens
-    // after success, which the file cannot express); WAITS_FOR 2 is soft.
+    // after success, which the file cannot express); WAITS_FOR 2 orders
+    // without gating.
     match dtype {
         0 | 3 => Some(to.to_string()),
-        2 => Some(format!("opt:{to}")),
+        2 => Some(format!("after:{to}")),
         _ => None,
     }
 }
@@ -3328,7 +3339,7 @@ mod tests {
     #[test]
     fn dotfiles_in_dotd_dirs_are_skipped() {
         // Real trees ship .KEEP placeholders (and symlinks) inside
-        // waits-for.d/depends-on.d dirs. An opt:.KEEP edge is fatal E010
+        // waits-for.d/depends-on.d dirs. An after:.KEEP edge is fatal E010
         // downstream, for a file that was never a service.
         let src = tmpout("dotd-src");
         let out = tmpout("dotd-out");
@@ -3341,7 +3352,7 @@ mod tests {
         assert_eq!(cmd_convert(&src, &out), 0);
         let got = std::fs::read_to_string(out.join("boot.conf")).unwrap();
         assert!(!got.contains(".KEEP"), "placeholder must not leak:\n{got}");
-        assert!(got.contains("opt:svc"), "real member stays:\n{got}");
+        assert!(got.contains("after:svc"), "real member stays:\n{got}");
     }
 
     #[test]
@@ -3435,7 +3446,7 @@ mod tests {
     #[test]
     fn before_mirror_skips_when_target_already_required() {
         // elogind orders itself before logind, and logind genuinely
-        // requires elogind: mirroring `opt:elogind` onto logind would pair
+        // requires elogind: mirroring `after:elogind` onto logind would pair
         // it with the required edge, which zinit rejects (E010). The
         // required edge already orders the pair, so the mirror must yield.
         let src = tmpout("before-src");
@@ -3453,9 +3464,32 @@ mod tests {
     }
 
     #[test]
+    fn after_and_waits_for_emit_order_only_edges() {
+        // dinit ordering without gating: `after` and `waits-for` become
+        // `after:` (the runtime waits for the first attempt, never for
+        // success), while `depends-on` stays required.
+        let src = tmpout("after-src");
+        let out = tmpout("after-out");
+        std::fs::write(
+            src.join("svc"),
+            "type = process\ncommand = /bin/s\ndepends-on = net\nafter = early\nwaits-for = late\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("net"), "type = process\ncommand = /bin/n\n").unwrap();
+        std::fs::write(src.join("early"), "type = process\ncommand = /bin/e\n").unwrap();
+        std::fs::write(src.join("late"), "type = process\ncommand = /bin/l\n").unwrap();
+        assert_eq!(cmd_convert(&src, &out), 0);
+        let got = std::fs::read_to_string(out.join("svc.conf")).unwrap();
+        assert!(
+            got.contains("depends = net, after:early, after:late\n"),
+            "ordering must not gate:\n{got}"
+        );
+    }
+
+    #[test]
     fn before_mirror_orders_when_no_edge_exists() {
-        // Pure ordering (no dependency either way): the soft mirror is
-        // the only record of it, so it must survive.
+        // Pure ordering (no dependency either way): the order-only mirror
+        // is the only record of it, so it must survive.
         let src = tmpout("before-src2");
         let out = tmpout("before-out2");
         std::fs::write(src.join("early"), "type = process\ncommand = /bin/e\nbefore = late\n")
@@ -3464,8 +3498,8 @@ mod tests {
         assert_eq!(cmd_convert(&src, &out), 0);
         let got = std::fs::read_to_string(out.join("late.conf")).unwrap();
         assert!(
-            got.contains("depends = opt:early"),
-            "soft ordering edge must be emitted:\n{got}"
+            got.contains("depends = after:early"),
+            "order-only edge must be emitted:\n{got}"
         );
     }
 
@@ -3671,7 +3705,7 @@ mod tests {
         assert!(c.text.contains("type = console\n"), "got:\n{}", c.text);
         assert!(c.text.contains("tty = /dev/console\n"), "got:\n{}", c.text);
         assert!(c.text.contains("command = /bin/srv %i --x=A_B\n"), "got:\n{}", c.text);
-        assert!(c.text.contains("depends = net, opt:other\n"), "got:\n{}", c.text);
+        assert!(c.text.contains("depends = net, after:other\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-budget = 5 restarts per 20s\n"), "got:\n{}", c.text);
         assert!(c.text.contains("restart-delay = 500ms\n"), "got:\n{}", c.text);
         assert!(c.text.contains("listen = unix:/run/s.sock\n"), "got:\n{}", c.text);
@@ -3826,7 +3860,7 @@ mod tests {
         assert_eq!(dctl(&zsock, &["rm-dep", "milestone", "b", "a", "--out", &od]), 0);
         assert_eq!(dctl(&zsock, &["add-dep", "waits-for", "a", "b", "--out", &od]), 0);
         let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
-        assert!(text.contains("depends = opt:b\n"), "got: {text}");
+        assert!(text.contains("depends = after:b\n"), "got: {text}");
         assert!(reloaded.load(Ordering::SeqCst));
         // removal works once, then refuses.
         assert_eq!(dctl(&zsock, &["rm-dep", "waits-for", "a", "b", "--out", &od]), 0);
@@ -4319,14 +4353,14 @@ mod tests {
         pkt.extend_from_slice(&th.to_le_bytes());
         client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
-        // WAITS_FOR has no state rule: persists `opt:b` + reload-all.
+        // WAITS_FOR has no state rule: persists `after:b` + reload-all.
         let mut pkt = vec![ADD_DEP, 2];
         pkt.extend_from_slice(&fh.to_le_bytes());
         pkt.extend_from_slice(&th.to_le_bytes());
         client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [ACK]);
         let text = std::fs::read_to_string(out.join("a.conf")).unwrap();
-        assert!(text.contains("depends = opt:b\n"), "got: {text}");
+        assert!(text.contains("depends = after:b\n"), "got: {text}");
         assert!(reloaded.load(Ordering::SeqCst));
         // duplicate add is a quiet ACK.
         client.write_all(&pkt).unwrap();
@@ -4342,8 +4376,8 @@ mod tests {
         // removing again is NAK.
         client.write_all(&rp).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
-        // cycle: b already soft-required on a, so a -> b is refused.
-        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\ndepends = opt:a\n").unwrap();
+        // cycle: b already order-waited on a, so a -> b is refused.
+        std::fs::write(out.join("b.conf"), "type = process\ncommand = /bin/b\ndepends = after:a\n").unwrap();
         client.write_all(&pkt).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
         drop(client);

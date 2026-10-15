@@ -108,7 +108,7 @@ jobs:
           grep -q '^restart = always$' out/mysql.conf
           grep -q '^restart-budget = 3 restarts per 10s$' out/mysql.conf
           grep -q '^depends = net$' out/notifier.conf
-          grep -q '^depends = opt:notifier$' out/log.conf
+          grep -q '^depends = after:notifier$' out/log.conf
           grep -q '^ready = notify$' out/notifier.conf
           grep -q '^command = exec 5>&\$ZINIT_NOTIFY_FD; exec /bin/daemon$' out/notifier.conf
           grep -q '^restart = always$' out/notifier.conf
