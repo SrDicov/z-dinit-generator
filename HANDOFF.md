@@ -426,3 +426,46 @@ Artix VM, all green:
   cause, dinit-dbus hang session, watch-vs-vanished-dirs,
   check-vs-sup unknown-dep gap. Next milestone per user: fix every
   open bug, then real remote-PC test.
+
+## 2026-10-14 (later) — watch decimation froze cold boots (fixed c3b64c4)
+
+`start` went unified first (c975f85: cmd_convert_dirs, one shared
+graph, later layer wins by name) to fix a split-brain no-boot, but
+cold boots still came up with 3 services (cronie/dbus/serial).
+Bisected live in the Artix VM, same binary everywhere (md5
+8aeb102e both sides):
+- `convert /usr/lib/dinit.d` alone → full chain enabled (udevd,
+  tmpfiles-setup, sysusers, local.target, system all clean).
+- A second `convert /etc/dinit.d` over the same outdir decimates:
+  etc owns its own `boot` file, so its closure runs over etc-only
+  pulls and disables everything outside it. Systematic, not a
+  shadowing bug (only `boot` is shadowed; pulls were complete).
+- The live decimator was `dinit-watch` (cmd_watch ran per-dir
+  converts on every fire, initial + on-change). Warm reloads hid it
+  (Desired preserved); cold boots froze.
+Fix c3b64c4: watch initial + re-fire go through cmd_convert_dirs.
+Regression test: reconversion keeps a cross-layer closure. CI green
+(ci + dinit-reference + chimera-e2e). Same-shape debt left in place:
+reconvert_and_reload still converts a single parent dir.
+Staging note: /etc/zinit/services.d is TRANSIENT (start/watch
+regenerate it); cage-artix/ on host was deliberately NOT re-synced —
+packaging regenerates at install.
+
+## 2026-10-14 (later) — Artix cold census under zinit (proof4/proof5)
+
+With fixed staging + cgroup-drop, cold boot: 94 supervised,
+17 running (NetworkManager, acpid, agetty, bluetoothd, chronyd,
+compatd, cronie, dbus, dhcpcd, dinit-watch, elogind, getty@tty5,
+metalog, serial, sshd, udevd, userspawn), ANOM=0, SSH OK against
+zinit PID 1. dbus runs from boot with no manual cgroup strip.
+- One boot-time race: sysusers (oneshot esysusers, restart=never,
+  log=none) died at boot → `suppressed` → local.target subtree
+  (pre-network/network/dhcpcd/sshd/elogind/metalog) gated forever.
+  Manual rerun exits 0; `kick` recovered the whole cascade.
+  Root cause + frequency OPEN (needs reboot-with-log to catch it;
+  log=none services die silently — observability gap, no death
+  announce in the log). Suspected early lock/order race, not ro-root
+  (/ stays rw: root-ro is out of closure by design).
+- TERM-to-sup re-proven: 0 running + `no poweroff path, stays up
+  and idle` announce. Note: the serial shell dies with the cascade,
+  so FIFO goes dead too — recovery is relaunch, not re-login.
