@@ -524,3 +524,18 @@ boot, sshd+dhcpcd running, 17 running, ANOM=0, SSH ok — zero
 interventions. Deploy note: new confs brick old sups (E008), so
 ship binary+staging together and reboot (ETXTBSY: install the
 running sup via rename, never direct overwrite).
+
+## 2026-10-15 — cgroup join root cause: NUL padding (found by reading)
+
+Every `cgroup =` service died pre-exec (exit 127) while manual joins
+worked and cgroup2 presence never mattered. Cause: `pid_ascii` fills
+right-to-left, but `child_step_cgroup` wrote `buf[0..len]` — NUL
+padding the kernel rejects with EINVAL. One-line fix via a named
+`pid_range` helper (+test); test helper reuses the new public
+`child_step_name` instead of its own table. Generator re-emits
+`run-in-cgroup` (Chimera corpus uses none, so e2e is safe; Artix
+dbus will prove it live). Enabler alongside: `SpawnFailed` now
+carries the pre-exec step (0 = refused before fork) and the sup
+announces `child failed at <step> (<err>)` — `poll_exec` used to
+discard the step word. Same session also fixed `reconvert_and_reload`
+(single-parent converts decimated like the old watch).
