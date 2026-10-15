@@ -1475,10 +1475,36 @@ fn reconvert_and_reload(
 /// Persist a dependency edge into the generated confs (shared with the
 /// compatd ADD_DEP path): REGULAR/MILESTONE are hard, WAITS_FOR is soft.
 fn dep_add_out(outdir: &std::path::Path, zsock: &str, from: &str, to: &str, dtype: u8) -> bool {
+    // Names ride the wire; a traversal here writes outside the services
+    // dir. Both ends must be plain service names (instances included).
+    if !valid_name(from) || !valid_name(to) {
+        return false;
+    }
     let tok = match dep_token(dtype, to) {
         Some(x) => x,
         None => return false,
     };
+    // Never write an edge to a ghost: the supervisor fatals the whole
+    // boot on an unknown required dep, so a dangling write bricks the
+    // machine on next reload (verified: dinit-dbus pinned an
+    // unmaterialized agetty-service@ttyS0 and agetty took the boot
+    // down with it). Synthesize base@arg from the base template when
+    // present, else refuse (NAK).
+    if !outdir.join(format!("{to}.conf")).is_file() {
+        let Some(at) = to.rfind('@') else {
+            return false;
+        };
+        let (base, arg) = (&to[..at], &to[at + 1..]);
+        if base.is_empty() || arg.is_empty() {
+            return false;
+        }
+        let Ok(t) = std::fs::read_to_string(outdir.join(format!("{base}.conf"))) else {
+            return false;
+        };
+        if std::fs::write(outdir.join(format!("{to}.conf")), t).is_err() {
+            return false;
+        }
+    }
     let mut deps = match read_depends(outdir, from) {
         Some(d) => d,
         None => return false,
@@ -3564,6 +3590,42 @@ mod tests {
             "soft mirror must not duplicate the required edge:\n{got}"
         );
         assert!(got.contains("elogind"), "required edge stays:\n{got}");
+    }
+
+    #[test]
+    fn dep_add_refuses_ghost_targets() {
+        // A dangling required edge fatals the whole boot at load, so the
+        // writer must refuse ghosts (verified: an unmaterialized
+        // agetty-service@ttyS0 bricked a Chimera boot). No daemon contact
+        // happens on refusal paths.
+        let out = tmpout("ghost");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
+        let dead = "/tmp/zdg-no-such-sock";
+        assert!(!dep_add_out(&out, dead, "a", "ghost", 0));
+        assert!(!dep_add_out(&out, dead, "a", "b@x", 0));
+        assert!(!dep_add_out(&out, dead, "a", "../evil", 0));
+        assert!(!dep_add_out(&out, dead, "../evil", "a", 0));
+        assert!(!out.join("b@x.conf").exists(), "nothing materialized");
+        assert!(!dep_add_out(&out, dead, "nosuch", "a", 0), "missing from-file");
+    }
+
+    #[test]
+    fn dep_add_synthesizes_instance_targets() {
+        // base@arg with a base template present materializes the
+        // instance and lands the edge, like the find_handle path.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reloaded = std::sync::Arc::new(AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded.clone());
+        let out = tmpout("isynth");
+        std::fs::write(out.join("a.conf"), "type = process\ncommand = /bin/a\n").unwrap();
+        std::fs::write(
+            out.join("base.conf"),
+            "type = process\ncommand = /bin/b %i\n",
+        )
+        .unwrap();
+        assert!(dep_add_out(&out, &zsock, "a", "base@tty1", 0));
+        assert!(out.join("base@tty1.conf").is_file());
+        assert!(reloaded.load(Ordering::SeqCst), "reload after synthesis");
     }
 
     #[test]
