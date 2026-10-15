@@ -1376,14 +1376,32 @@ fn meta_enable_via(svc_file: &std::path::Path) -> Option<String> {
     None
 }
 
-/// Re-convert the directory holding a dinit source file, then reload-all
-/// (skipped offline, where there is no daemon to tell).
-fn reconvert_and_reload(src_file: &std::path::Path, outdir: &std::path::Path, offline: bool) -> bool {
+/// Re-convert the layered source dirs holding a dinit source file, then
+/// reload-all (skipped offline, where there is no daemon to tell).
+///
+/// All layers, never just the parent: a single-dir convert runs the boot
+/// closure over a partial graph, and a layer owning its own `boot` file
+/// (like /etc/dinit.d) then disables everything outside it — the same
+/// decimation `watch` used to do before cmd_convert_dirs.
+fn reconvert_and_reload(
+    src_file: &std::path::Path,
+    dirs: &[std::path::PathBuf],
+    outdir: &std::path::Path,
+    offline: bool,
+) -> bool {
     let parent = match src_file.parent() {
         Some(p) => p,
         None => return false,
     };
-    if cmd_convert(parent, outdir) != 0 {
+    let mut layers: Vec<std::path::PathBuf> = dirs
+        .iter()
+        .filter(|d| d.is_dir())
+        .cloned()
+        .collect();
+    if !layers.iter().any(|d| d == parent) {
+        layers.push(parent.to_path_buf());
+    }
+    if cmd_convert_dirs(&layers, outdir) != 0 {
         return false;
     }
     if offline {
@@ -1805,7 +1823,7 @@ fn cmd_dinitctl_sock(args: &[String], sock_override: Option<&str>) -> i32 {
             let dirs = dinit_source_dirs(&o.sdirs);
             match find_dinit_file(&dirs, &rest[0]) {
                 Some(f) => {
-                    if reconvert_and_reload(&f, &outdir, o.offline) {
+                    if reconvert_and_reload(&f, &dirs, &outdir, o.offline) {
                         0
                     } else {
                         warn(format!("reload {} failed", rest[0]));
@@ -1887,7 +1905,7 @@ fn cmd_dinitctl_sock(args: &[String], sock_override: Option<&str>) -> i32 {
                 qwarn(format!("{from} is not enabled on {to}"));
                 return 1;
             }
-            if reconvert_and_reload(&to_file, &outdir, o.offline) {
+            if reconvert_and_reload(&to_file, &dirs, &outdir, o.offline) {
                 0
             } else {
                 warn(format!("{cmd} {from} -> {to} failed"));
@@ -3421,6 +3439,30 @@ mod tests {
                 "{svc} must survive reconversion:\n{got}"
             );
         }
+    }
+
+    #[test]
+    fn reconvert_single_file_uses_all_layers() {
+        // The dinitctl reload/enable path re-converts on one file edit;
+        // converting only that file's parent runs the closure over a
+        // partial graph (an etc layer owns its own boot), decimating
+        // everything outside it. Reconvert must share the graph.
+        let usr = tmpout("rr-usr");
+        let etc = tmpout("rr-etc");
+        let out = tmpout("rr-out");
+        std::fs::write(usr.join("lib"), "type = process\ncommand = /bin/lib\n").unwrap();
+        std::fs::write(usr.join("mid"), "type = process\ncommand = /bin/mid\ndepends-on = lib\n")
+            .unwrap();
+        std::fs::write(etc.join("boot"), "type = internal\ndepends-on = mid\n").unwrap();
+        let dirs = vec![usr.clone(), etc.clone()];
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        // Trigger from the usr layer, like `dinitctl reload mid`.
+        assert!(reconvert_and_reload(&usr.join("mid"), &dirs, &out, true));
+        let got = std::fs::read_to_string(out.join("lib.conf")).unwrap();
+        assert!(
+            !got.contains("enabled = no"),
+            "cross-layer dep must survive single-file reconvert:\n{got}"
+        );
     }
 
     #[test]
