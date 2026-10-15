@@ -543,6 +543,7 @@ fn convert_one(
     let mut notifyfd = String::new();
     let mut stopcmd = String::new();
     let mut command_raw = String::new();
+    let mut pass_cs_fd = false;
     let mut stopcmd_raw = String::new();
     let mut chain = String::new();
     let mut chainalways = false;
@@ -713,6 +714,9 @@ fn convert_one(
                         "runs-on-console" => run_console = true,
                         // inherent: the child path always sets no-new-privs.
                         "no-new-privs" => {}
+                        // dinit passes its control-socket fd; under
+                        // supervision the bridge connects by path.
+                        "pass-cs-fd" => pass_cs_fd = true,
                         _ => w!(format!("option {o} ignored")),
                     }
                 }
@@ -896,6 +900,19 @@ fn convert_one(
         if dropped {
             w!("--dinit dropped: no dinit activation under supervision; daemon binds itself".to_string());
         }
+    }
+    // pass-cs-fd becomes an explicit socket path: compatd listens on its
+    // default, and dinit-dbus -S connects there instead of waiting on an
+    // fd nobody passes (verified live: FD-less dinit-dbus exits at once).
+    if pass_cs_fd {
+        for twin in [&mut command, &mut command_raw] {
+            twin.push_str(" -S ");
+            twin.push_str(DINIT_SOCK_DEFAULT);
+        }
+        w!(format!(
+            "pass-cs-fd mapped to -S {} (compatd default)",
+            DINIT_SOCK_DEFAULT
+        ));
     }
     let mut stunt = String::new();
     if !stopcmd_raw.is_empty() {
@@ -3547,6 +3564,25 @@ mod tests {
             "soft mirror must not duplicate the required edge:\n{got}"
         );
         assert!(got.contains("elogind"), "required edge stays:\n{got}");
+    }
+
+    #[test]
+    fn pass_cs_fd_becomes_explicit_socket_path() {
+        // dinit passes its control fd; supervised, the bridge connects
+        // by path (verified: FD-less dinit-dbus exits "no file descriptor").
+        let src = tmpout("cs-src");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let text = "type = process\ncommand = /usr/bin/dinit-dbus -s\noptions: pass-cs-fd\n";
+        let c = convert_one(&text, "svc", &src, &mut pulls, &mut befores, &mut warns)
+            .expect("converts");
+        assert!(
+            c.text.contains("command = /usr/bin/dinit-dbus -s -S /run/dinitctl\n"),
+            "socket path must be explicit:\n{}",
+            c.text
+        );
+        assert!(warns.join("\n").contains("pass-cs-fd mapped"), "loud warn expected");
     }
 
     #[test]
