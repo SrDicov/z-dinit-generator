@@ -108,6 +108,16 @@ fn is_blank_spaces(s: &str) -> bool {
 }
 
 
+/// True when `text` carries an operator `enabled =` pin, trailing `#`
+/// comments ignored (the conf parser treats `#` as comment-to-EOL, so the
+/// detector must too). Exact matching silently unpinned annotated files.
+fn has_operator_pin(text: &str) -> bool {
+    text.lines().any(|l| {
+        let bare = l.split('#').next().unwrap_or("").trim();
+        bare == "enabled = no" || bare == "enabled = yes"
+    })
+}
+
 fn squote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('\'');
@@ -1331,10 +1341,11 @@ fn cmd_convert_dirs(dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i
                 // with `enabled = no` — visible, reversible, no data loss.
                 // Any present `enabled =` line (yes or no) is respected as
                 // the operator's pin: appending another is fatal E005.
-                let has_enabled = cur.lines().any(|l| {
-                    let t = l.trim();
-                    t == "enabled = no" || t == "enabled = yes"
-                });
+                // Comment-tolerant: the parser treats `#` as comment-to-EOL,
+                // so `enabled = yes # operator` IS a pin — exact matching
+                // dropped annotated pins on the floor (live: an operator
+                // pin with a trailing comment was not recognised).
+                let has_enabled = has_operator_pin(&cur);
                 if has_enabled {
                     continue;
                 }
@@ -3514,6 +3525,18 @@ mod tests {
         assert!(!valid_name("a..b"));
         assert!(!valid_name("a@b@c"));
         assert!(!valid_name("a b"));
+    }
+
+    #[test]
+    fn pin_survives_trailing_comment() {
+        // Live: `enabled = yes # operator` was not recognised as a pin
+        // (exact string match), so annotated files were treated as
+        // unpinned. The parser strips `#` comments, the detector must too.
+        assert!(has_operator_pin("type = process\nenabled = yes # operator\n"));
+        assert!(has_operator_pin("enabled = no\n"));
+        assert!(has_operator_pin("  enabled = yes  \n"));
+        assert!(!has_operator_pin("type = process\ncommand = /bin/x\n"));
+        assert!(!has_operator_pin("# enabled = yes\n"));
     }
 
     #[test]
