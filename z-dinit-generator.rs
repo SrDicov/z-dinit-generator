@@ -873,7 +873,11 @@ fn convert_one(
     // Shell assembly (same comments as dinit-import.sh).
     let mut pre = String::new();
     if !wdir.is_empty() {
-        pre.push_str(&format!("cd {} && ", squote(&wdir)));
+        // Double quotes, not squote: dinit expands variables in
+        // working-dir (`$HOME`), and the shell must see them expandable.
+        // Single quotes froze them literally (live: user dbus-daemon got
+        // `cd '$HOME'` and started in the wrong place).
+        pre.push_str(&format!("cd \"{wdir}\" && "));
     }
     if !notifyfd.is_empty() {
         if zt == "oneshot" || zt == "forking" {
@@ -3537,6 +3541,31 @@ mod tests {
         assert!(has_operator_pin("  enabled = yes  \n"));
         assert!(!has_operator_pin("type = process\ncommand = /bin/x\n"));
         assert!(!has_operator_pin("# enabled = yes\n"));
+    }
+
+    #[test]
+    fn working_dir_keeps_variable_expandable() {
+        // Live: `working-dir = $HOME` became `cd '$HOME'` (single-quoted,
+        // frozen) and the daemon started in the wrong directory. dinit
+        // expands variables here, so the shell must too: double quotes.
+        let dir = tmpout("wdir");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /bin/daemon\nworking-dir = $HOME\n",
+            "s",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(
+            c.text.contains("cd \"$HOME\""),
+            "variable must stay expandable:\n{}",
+            c.text
+        );
     }
 
     #[test]
