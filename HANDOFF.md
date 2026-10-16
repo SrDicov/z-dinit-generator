@@ -599,3 +599,14 @@ ship binary+staging together and reboot; ETXTBSY on install
 mid-session and qemu eats stdin EOF); MaxStartups self-DoS on
 repeated banner-timeout attempts (reboot clears); debugfs surgery
 only with qemu stopped + e2fsck after (page-cache divergence lies).
+\n
+## 2026-10-16 — soak 24h launched on Artix proof18 (P3)
+
+Driver `matrix/soak.sh` (host side, over ssh): random restart of a
+running service every 5 min (pool recomputed each round, sshd
+hard-excluded — it is the control channel), reload-all every 30 min
+(manually verified safe: 94 services, 17 stay running), sup PSS/FDs/
+threads + system zombies + census every 60 min, all to
+`matrix/soak-artix.log`. Baseline sup PSS 1366 kB. P0 (fatal vs
+tolerate) deliberately NOT decided tonight — documented decision
+reserved for the morning; nothing tonight depends on it.
