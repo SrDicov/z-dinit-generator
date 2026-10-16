@@ -642,3 +642,35 @@ on-fatal=reboot lands stop-all-idle + loud no-reboot-path announce
 Tomorrow: soak curve verdict, P1-Artix on vm-p1.raw, P2 reboot,
 docs (READMEs/MIGRATION/KNOWN_ISSUES/CONTRIBUTING), release
 workflow, then publish decision (alpha/beta/no).
+
+## 2026-10-16 — host reboot, matrix rebuilt, P1 live (morning)
+
+Host rebooted ~04:40Z (all qemus SIGTERM'd by pid 13659, soak died at
+03:35Z with 1h of good data: PSS 1381kB, zombies 0, census 17 — infra
+loss, not product). Matrix relaunched from disks; recipes that bit:
+- Void needs `ip=dhcp rd.neednet=1` on the dracut cmdline (guest has
+  no net service; without it boots fine with no address, ssh RSTs).
+- Chimera2 sshd.conf carried convert-stamped `enabled = no` (hand-
+  started last night, never persisted) → ssh dead after reboot.
+  STRIPPED offline (fsck+mount, one sed), ssh back. SEASONING RULE:
+  core services (sshd) must not carry enabled=no; strip at seasoning.
+- Absolute qemu paths only (relative kernel path fails silently-ish).
+Criterion-2 audit (all four, zero unexplained):
+- Artix 94: 46 completed + running + disabled, 0 suspects, 0 failed.
+  (3 ex-suspects agetty/boot/system EXPLAINED: live dep_add edges to
+  convert-disabled getty@ttyN + no demand-start; manual start of the
+  6 gettys converges to dinit-ref parity — mechanism proven, only
+  automation missing. Filed as known divergence, not a boot blocker.)
+- Void 6: 4 running + 1 completed + 1 down, 0 suspects, 0 failed.
+- Alpine 5: 2 running + 2 completed + probe held-done (artifact), 0 failed.
+- Chimera 74: 13 running + 52 completed + 8 disabled + probe, 0 failed.
+- Dinit-ref (vm-dinit.raw, 2227): 65 services, boot/system/agetty +
+  6 gettys STARTED — the parity bar.
+P1 (vm-p1.raw, dinit PID 1, port 2229): dinit 65 captured pre-shadow;
+P0 bins deployed (zinit 799f2c03, CI 8e3fcb1); `zdg start` reconverted
+94; sup as child of dinit, 3 running (compatd/watch/serial), 0 failed;
+dinitctl→compatd by design (compare vs captured list, never live
+dinitctl); parity dinit⊆zinit PERFECT (0 missing, 29 extra = shim+tree).
+Soak relaunched 07:06Z on pre-P0 binary (baseline sup=71 PSS=948kB
+fds=79) — clock runs; verdict due tomorrow, cannot close today.
+Docs: MIGRATING.md dinit road, KNOWN_ISSUES.md, CONTRIBUTING.md pushed.
