@@ -736,3 +736,22 @@ Release smoke dispatched (run 38871921962).
   needed or pending. The acta's "consolidacion" line was wrong.
 - Demand test fixed twice (Display->plain, one-pass->dep-first
   two-pass: puller honors dep gate until Running). CI green b086057.
+
+## 2026-10-16 — session close (all VMs off, background clean)
+
+Shutdown: graceful stop-all+sync via ssh on 2226/2222/2224/2229
+(sup 71/1022/586/70), then kill -9 all 7 qemus, soak.sh + 5 FIFO
+holders dead, 0 listeners left. Chimera (2228) got NO graceful stop
+(ssh RST + no serial password) — power cut with 74 services alive.
+
+NEXT SESSION, in order:
+1. Chimera P2 unverified (3/4 distros proven). Requires: `e2fsck -y
+   vm-chimera2.raw`, boot with `init=/bin/sh` to check fs clean,
+   then P2 (bootloader-default already? VERIFY /sbin/init flip on
+   chimera first — Alpine/Void were found on native inits, so audit
+   `cat /proc/1/cmdline` on EVERY image before trusting it).
+2. vm-void.raw: TWO qemus ran concurrently on it — do NOT reuse.
+   Regenerate from template (20 min), don't debug ghost corruption.
+3. Soak 24h interrupted (4 points, slope -21.1, no verdict). Relaunch
+   from zero, frozen binary, hourly sampling, no gaps.
+4. Beta tag waits on soak verdict + Chimera P2.
