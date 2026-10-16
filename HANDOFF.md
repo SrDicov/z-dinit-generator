@@ -832,3 +832,45 @@ per-session manager, not system init).
   4. Run /tmp/opencode/box-p0-verify.sh (on dev machine) for the P0 gate.
 - Lesson: never signal the production sup; restart = one-shot reboot
   (proven 15s, twice). This path is now the documented deploy procedure.
+
+## 2026-10-16 ~19:00-19:25Z — recovery + P0/P1 gates (all green)
+- Recovery: user power-cycled (dinit default, net back), `grub-reboot` with
+  the TRUNCATED id did nothing (boots dinit, next_entry consumed). Full id
+  is `gnulinux-zinit-44a208a1-e985-43c1-a5f8-0cec92d13414` (trailing `14`).
+  With the full id: one-shot → PID1=zinit in 15s. Lesson: never trust the
+  remembered id; `grep menuentry_id_option /boot/grub/grub.cfg` first.
+- P0 closed: 6fbbe628 live on /sbin+/usr/bin (same md5), single sup,
+  25/74→24/73 (bluetoothd down pre-activation), 0 failed, 0 zombies.
+  chronyd restarts reset to 0/3 and flat (P2.1 observing; was cumulative).
+  NOTE: `doas kill <sup>` = stop-all (sshd+NM down, netless box). Deploy
+  procedure = one-shot reboot, never signal the sup.
+- Spawn-expansion fix proven LIVE (e2e): `type=process ready=notify`
+  `command=/bin/echo FD=$ZINIT_NOTIFY_FD` + log=file → log shows `FD=3`.
+  Old code gave `FD=` (empty). Test conf had NO single quotes (process
+  commands are argv words, not shell — quoted attempt failed loudly and
+  taught us that) and needs restart=always to cycle; cleaned up after.
+- P1.2 CLOSED (was the big unknown): `loginctl poweroff` → RC=0 → box dark
+  in ~15s → breadcrumb `poweroff: stop-all done, acting` → orderly path
+  through the sup (not a direct reboot). Earlier "no-op" report was from
+  the double-sup chaos window. elogind never execs /sbin/poweroff (no such
+  strings in binary/.so) yet the sup verb fired — chain works end to end.
+- suspend PROVEN: `zctl suspend` → dark (mem sleep) → power tap → resume,
+  same boot (uptime 19:15:28 kept), census 24/73/0, 0 zombies.
+  hibernate NAK honest confirmed: `E 6 hibernate needs a resume target`.
+  Observation (not alarm): after resume sshd/tailscaled/chronyd show
+  up=~1m with restarts=0 — respawned at wake without counting. All green.
+- zdg pin fix deployed: musl-static rebuilt locally
+  (`rustc --target x86_64-unknown-linux-musl -C strip=symbols`, 811784 B,
+  md5 315b8368), installed both paths, `zctl restart compatd` clean,
+  dinitctl instant RC=0. CI artifact is glibc — unusable on musl Chimera.
+- P3 done: only runB/runD existed; archived, reload clean, no resurrection.
+- P2.2 closed: iwd.conf generated, `enabled=no` from closure is CORRECT
+  (NM+wpa_supplicant own wlp2s0, UP). No pin needed; pins belong in
+  `iwd.d/*.conf` drop-ins, never in generated files. No drop-in created.
+- P2.3 running: no forking service exists in plan (agetty is process!) so
+  the hold-window hypothesis is already weakened; 10k-sample staleprobe
+  (/bin/true + always) polling in background on box → /tmp/stale-result.log.
+- Soak: previous series invalidated by today; sampler running, new 24h
+  window from 23:15Z. Verdict due 2026-10-17 ~23:15Z.
+- GRUB default still 0 (dinit). Box booted zinit this time via manual menu
+  pick at power-on. Default flip stays user decision post-soak.
