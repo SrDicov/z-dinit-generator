@@ -6,8 +6,15 @@ pkgdesc="Perfect dinit replacement frontend for zinit (convert + watch + dinitct
 arch=('x86_64' 'aarch64')
 url="https://github.com/SrDicov/z-dinit-generator"
 license=('GPL-3.0-or-later')
+# Co-installable with dinit by design: the P1 transition runs both
+# supervisors side by side, so this package must NOT provide/conflict
+# `dinit` and must NOT ship /usr/bin/dinitctl (dinit owns it until
+# `pacman -R dinit`; the shim arrives as an untracked symlink, see
+# z-dinit-generator.install). A provides/conflicts pair would forbid
+# the coexistence the migration documents.
 depends=('zinit')
 makedepends=('rust')
+install=z-dinit-generator.install
 source=("z-dinit-generator.rs")
 sha256sums=('SKIP')
 
@@ -17,5 +24,4 @@ build() {
 
 package() {
   install -Dm755 "$srcdir/z-dinit-generator" "$pkgdir/usr/bin/z-dinit-generator"
-  ln -sf z-dinit-generator "$pkgdir/usr/bin/dinitctl"
 }
