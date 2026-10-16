@@ -2420,18 +2420,39 @@ fn dep_token(dtype: u8, to: &str) -> Option<String> {
     }
 }
 
-// Serve one client until EOF, error or protocol violation. Handles are
-// unique across connections via the shared counter; each connection
-// keeps its own handle->name table (like dinit itself).
-fn serve_one(
-    s: &mut UnixStream,
-    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    names: &mut BTreeMap<u32, String>,
-    ctx: &Ctx,
-) {
+/// Handles shared across compatd connections: one thread per client, so a
+/// silent holder can never wedge the next client (live: a stuck add-dep
+/// parked serve_one in read, all later dinitctl hung RC=124). Handles stay
+/// unique via the counter and visible on every connection (upstream
+/// semantics: a fresh socket reuses the same handles). Critical sections
+/// are allocation/lookup only, never held across socket IO; a poisoned
+/// lock closes the connection (BADREQ) instead of panicking.
+struct Handles {
+    next: u32,
+    names: BTreeMap<u32, String>,
+}
+type SharedHandles = std::sync::Arc<std::sync::Mutex<Handles>>;
+fn h_alloc(h: &SharedHandles, svc: String) -> Option<u32> {
+    h.lock().ok().map(|mut g| {
+        let id = g.next;
+        g.next += 1;
+        g.names.insert(id, svc);
+        id
+    })
+}
+fn h_get(h: &SharedHandles, id: u32) -> Option<String> {
+    h.lock().ok().and_then(|g| g.names.get(&id).cloned())
+}
+fn h_has(h: &SharedHandles, id: u32) -> bool {
+    h.lock().map(|g| g.names.contains_key(&id)).unwrap_or(false)
+}
+fn h_remove(h: &SharedHandles, id: u32) -> bool {
+    h.lock().map(|mut g| g.names.remove(&id).is_some()).unwrap_or(false)
+}
+// Serve one client until EOF, error or protocol violation.
+fn serve_one(s: &mut UnixStream, handles: SharedHandles, ctx: &Ctx) {
     // One thread per connection (see cmd_compatd): a silent holder must
-    // never wedge the next client, so handles stay unique across threads
-    // via the shared counter while each connection keeps its own names.
+    // never wedge the next client.
     // BADREQ closes the connection, like control.cc (bad_conn_close).
     macro_rules! badreq {
         () => {{
@@ -2468,13 +2489,13 @@ fn serve_one(
                 let svc = String::from_utf8_lossy(&name).into_owned();
                 match z_status(&ctx.zsock, &svc) {
                     Some(st) => {
-                        let id = counter
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some(id) = h_alloc(&handles, svc) else {
+                            badreq!();
+                        };
                         let mut reply = [SERVICERECORD, 0, 0, 0, 0, 0, 0];
                         reply[1] = st.state;
                         reply[2..6].copy_from_slice(&id.to_le_bytes());
                         reply[6] = st.target;
-                        names.insert(id, svc);
                         if !wr_all(s, &reply) {
                             return;
                         }
@@ -2505,10 +2526,9 @@ fn serve_one(
                                         }
                                     }
                                     if let Some(st) = z_status(&ctx.zsock, &svc) {
-                                        let id = counter.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::SeqCst,
-                                        );
+                                        let Some(id) = h_alloc(&handles, svc) else {
+                                            badreq!();
+                                        };
                                         let mut reply =
                                             [SERVICERECORD, 0, 0, 0, 0, 0, 0];
                                         reply[1] = st.state;
@@ -2516,7 +2536,6 @@ fn serve_one(
                                             &id.to_le_bytes(),
                                         );
                                         reply[6] = st.target;
-                                        names.insert(id, svc);
                                         served = wr_all(s, &reply);
                                         if !served {
                                             return;
@@ -2528,11 +2547,11 @@ fn serve_one(
                                 return;
                             }
                         } else {
-                            let id = counter
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let Some(id) = h_alloc(&handles, svc) else {
+                                badreq!();
+                            };
                             let mut reply = [SERVICERECORD, 2, 0, 0, 0, 0, 2];
                             reply[2..6].copy_from_slice(&id.to_le_bytes());
-                            names.insert(id, svc);
                             if !wr_all(s, &reply) {
                                 return;
                             }
@@ -2548,7 +2567,7 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
-                let name = match names.get(&handle).cloned() {
+                let name = match h_get(&handles, handle) {
                     Some(n) => n,
                     None => badreq!(),
                 };
@@ -2599,7 +2618,7 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes(rest);
-                if !names.contains_key(&handle) {
+                if !h_has(&handles, handle) {
                     badreq!();
                 }
                 if !wr_all(s, &[ACK]) {
@@ -2647,7 +2666,7 @@ fn serve_one(
                 if !rd_n(s, &mut rest) {
                     return;
                 }
-                if !names.contains_key(&u32::from_le_bytes(rest)) {
+                if !h_has(&handles, u32::from_le_bytes(rest)) {
                     badreq!();
                 }
                 if !wr_all(s, &[NAK]) {
@@ -2692,7 +2711,7 @@ fn serve_one(
                 }
                 let from_h = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 let to_h = u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]);
-                let (from, to) = match (names.get(&from_h).cloned(), names.get(&to_h).cloned()) {
+                let (from, to) = match (h_get(&handles, from_h), h_get(&handles, to_h)) {
                     (Some(f), Some(tn)) if f != tn => (f, tn),
                     _ => badreq!(),
                 };
@@ -2836,7 +2855,7 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
-                match names.get(&handle) {
+                match h_get(&handles, handle) {
                     Some(n) => {
                         let nb = n.as_bytes();
                         let mut pkt = Vec::with_capacity(4 + nb.len());
@@ -2860,7 +2879,7 @@ fn serve_one(
                 if !rd_n(s, &mut rest) {
                     return;
                 }
-                if !names.contains_key(&u32::from_le_bytes(rest)) {
+                if !h_has(&handles, u32::from_le_bytes(rest)) {
                     badreq!();
                 }
                 // ponytail: reload-all re-reads everything; per-service
@@ -2907,8 +2926,8 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes(rest);
-                let name = match names.get(&handle) {
-                    Some(n) => n.clone(),
+                let name = match h_get(&handles, handle) {
+                    Some(n) => n,
                     None => {
                         if !wr_all(s, &[NAK]) {
                             return;
@@ -2953,8 +2972,7 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
-                let data = names
-                    .get(&handle)
+                let data = h_get(&handles, handle)
                     .and_then(|n| std::fs::read_to_string(ctx.outdir.join(format!("{n}.conf"))).ok())
                     .and_then(|text| {
                         text.lines().find_map(|l| {
@@ -2992,8 +3010,8 @@ fn serve_one(
                 }
                 let signum = i32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
                 let handle = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
-                let name = match names.get(&handle) {
-                    Some(n) => n.clone(),
+                let name = match h_get(&handles, handle) {
+                    Some(n) => n,
                     None => {
                         if !wr_all(s, &[NAK]) {
                             return;
@@ -3035,7 +3053,7 @@ fn serve_one(
                     return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
-                if rest[0] != 0 || !names.contains_key(&handle) {
+                if rest[0] != 0 || !h_has(&handles, handle) {
                     if !wr_all(s, &[NAK]) {
                         return;
                     }
@@ -3057,7 +3075,7 @@ fn serve_one(
                     return;
                 }
                 let h = u32::from_le_bytes(rest);
-                if names.remove(&h).is_none() {
+                if !h_remove(&handles, h) {
                     // Unknown handle closes the connection upstream too.
                     badreq!();
                 }
@@ -3141,15 +3159,15 @@ fn cmd_compatd(path: &str, outdir: &std::path::Path) -> i32 {
     // sends or disconnects, and a single-threaded loop lets one silent
     // holder wedge every later client (live: stuck add-dep parked the
     // loop, all later dinitctl hung with RC=124). Threads are std-only.
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let handles: SharedHandles =
+        std::sync::Arc::new(std::sync::Mutex::new(Handles { next: 0, names: BTreeMap::new() }));
     for conn in listener.incoming() {
         if let Ok(s) = conn {
-            let counter = counter.clone();
+            let handles = handles.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 let mut s = s;
-                let mut names = BTreeMap::new();
-                serve_one(&mut s, counter, &mut names, &ctx);
+                serve_one(&mut s, handles, &ctx);
             });
         }
     }
@@ -3885,10 +3903,11 @@ mod tests {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut server = server;
-            let mut names = names;
-            let counter =
-                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(next));
-            serve_one(&mut server, counter, &mut names, &ctx);
+            let handles = std::sync::Arc::new(std::sync::Mutex::new(Handles {
+                next,
+                names,
+            }));
+            serve_one(&mut server, handles, &ctx);
         })
     }
 
