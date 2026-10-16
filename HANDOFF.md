@@ -614,3 +614,31 @@ reserved for the morning; nothing tonight depends on it.
 Soak metric scope (answering tomorrow's q3 in advance): the PSS number
 is PID 71 (`zinit --sup`) alone — PID 1 is a separate `zinit` process
 and supervised children are not included.
+
+## 2026-10-16 — closing: P0 merged, soak running, P1 staged
+
+P0 (tolerate by default, on-fatal ignore|warn|halt|reboot) implemented
+in zcore+zconfig+sup with docs/fatal-policy.md, merged as zinit
+testing@8e3fcb1, CI green (fuzz/property/alpine/distro/ci incl. a
+real clippy catch fixed same-cycle). Open item flagged, not hidden:
+on-fatal=reboot lands stop-all-idle + loud no-reboot-path announce
+(sup has no power path; same reason SIGTERM stays idle).
+- Unknown required at load now holds the service + W103 instead of
+  global fatal (UnknownDependency variant removed).
+- Void smoke (subagent): ANOM=0, 46min, 0 zombies. Alpine: validated
+  directly (5/5 ssh). Docs + Alpine subagents died on provider rate
+  limits; docs pending, Alpine covered by hand.
+- Soak: alive on Artix proof18 (rounds every 5min, sshd excluded,
+  reload verified safe first). Metrics #1: PSS 1381kB (+15/h, noise),
+  zombies 0, census 17. Scope: PSS = `zinit --sup` process alone.
+- P1 staged without touching the soak: vm-artix.raw untouched,
+  vm-p1.raw = verified 4GB copy; dinit-ref VM paused (RAM was tight,
+  ground truth saved to matrix/dinit-started-artix.txt, 66 names).
+  P1 boots the copy with init=/usr/bin/dinit (dinit binaries present
+  on disk), then pacman -U / start / verify / -R dinit / 1h window.
+- VMs live: artix+soak (2226), chimera old+new2 (2225/2228), void
+  (2224), alpine (2222). Holders are sleep-infinity (3600s ones die
+  mid-session and qemu eats stdin EOF).
+Tomorrow: soak curve verdict, P1-Artix on vm-p1.raw, P2 reboot,
+docs (READMEs/MIGRATION/KNOWN_ISSUES/CONTRIBUTING), release
+workflow, then publish decision (alpha/beta/no).
