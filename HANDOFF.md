@@ -814,3 +814,21 @@ per-session manager, not system init).
   The lockout is over.
 - chronyd restarts counter is historical (300); process stable since fix.
 - Box hygiene: strace removed (715 pkgs), /tmp scrubbed, scratch sup gone.
+
+## 2026-10-16 ~18:45Z — SELF-INFLICTED NET LOSS, recovery path (box offline)
+- What happened: to deploy zinit 6fbbe628 (spawn-expansion fix) without
+  reboot I ran `doas kill <sup-pid>`. Wrong command: SIGTERM to --sup
+  means "stop every service, stay up idle" — sshd + NetworkManager went
+  down, box is networkless (tailnet offline, LAN silent). Sup is alive
+  but idle; nothing will come back on its own.
+- The new binary IS on disk (/sbin+z + /usr/bin+z = 6fbbe628). Any boot
+  into zinit runs the fixed code; sup restart also zeroes the chronyd
+  restarts counter (runtime state).
+- Recovery (needs physical access, ~5 min):
+  1. Hold power 5s (console gettys are stopped, no login possible).
+  2. Box boots dinit (grub default, untouched) → network back on its own.
+  3. SSH in, `doas grub-reboot gnulinux-zinit-44a208a1-e985-43c1-a5f8-0cec92d134`
+     then `doas reboot` → PID1=zinit in ~15s with the new binary.
+  4. Run /tmp/opencode/box-p0-verify.sh (on dev machine) for the P0 gate.
+- Lesson: never signal the production sup; restart = one-shot reboot
+  (proven 15s, twice). This path is now the documented deploy procedure.
