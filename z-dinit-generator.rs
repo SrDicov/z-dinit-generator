@@ -619,7 +619,16 @@ fn convert_one(
                 let dd = v.clone();
                 let bn = dd.rsplit('/').next().unwrap_or(&dd).to_string();
                 let cand_in = in_dir.join(&bn);
-                let dd_path = if cand_in.is_dir() {
+                // An absolute dir value names its own directory: reading
+                // in_dir.join(basename) instead hijacks it whenever the
+                // file's own dir happens to hold a same-named subdir
+                // (Chimera: boot's `waits-for.d: /etc/dinit.d/boot.d` read
+                // /usr/lib/dinit.d/boot.d, so sshd/networkmanager/tailscaled
+                // fell out of the boot closure and got `enabled = no`).
+                // Relative values keep the old in_dir resolution.
+                let dd_path = if std::path::Path::new(&dd).is_absolute() {
+                    std::path::PathBuf::from(&dd)
+                } else if cand_in.is_dir() {
                     cand_in
                 } else {
                     std::path::PathBuf::from(&dd)
@@ -3521,6 +3530,36 @@ mod tests {
                 "{svc} is boot-reachable and must stay enabled:\n{got}"
             );
         }
+    }
+
+    #[test]
+    fn absolute_dir_value_beats_same_named_subdir() {
+        // Chimera root cause: boot (in usr) says
+        // `waits-for.d: <etc>/boot.d`, but usr holds its own boot.d
+        // subdir with decoys. The literal absolute path must win; the
+        // file's own dir is only consulted for relative values.
+        let usr = tmpout("absdir-usr");
+        let etc = tmpout("absdir-etc");
+        let out = tmpout("absdir-out");
+        std::fs::create_dir_all(usr.join("boot.d")).unwrap();
+        std::fs::write(usr.join("boot.d").join("decoy"), "type = process\ncommand = /bin/decoy\n")
+            .unwrap();
+        std::fs::write(usr.join("decoy"), "type = process\ncommand = /bin/decoy\n").unwrap();
+        std::fs::create_dir_all(etc.join("boot.d")).unwrap();
+        std::fs::write(etc.join("boot.d").join("real"), "type = process\ncommand = /bin/real\n")
+            .unwrap();
+        std::fs::write(etc.join("real"), "type = process\ncommand = /bin/real\n").unwrap();
+        std::fs::write(
+            usr.join("boot"),
+            format!("type = internal\nwaits-for.d: {}/boot.d\n", etc.display()),
+        )
+        .unwrap();
+        let dirs = vec![usr, etc];
+        assert_eq!(cmd_convert_dirs(&dirs, &out), 0);
+        let got = std::fs::read_to_string(out.join("real.conf")).unwrap();
+        assert!(!got.contains("enabled = no"), "literal dir member must stay enabled:\n{got}");
+        let got = std::fs::read_to_string(out.join("decoy.conf")).unwrap();
+        assert!(got.contains("enabled = no"), "same-named subdir decoy must stay out:\n{got}");
     }
 
     #[test]
