@@ -579,3 +579,23 @@ MaxStartups on repeated banner-timeout attempts (self-DoS, reboot to
 clear), serial console login never worked here (ssh-key only; root
 password unknown, empty rejected — debugfs shadow edits need a
 reboot to be seen, page cache).
+\n
+## 2026-10-16 — full matrix on the new stack (cold boots, ssh everywhere)
+
+- Artix (glibc, full tree): 94 supervised, 17 running, ANOM=0, sysusers
+  completes at boot (oneshot-completion gate), dbus runs first try WITH
+  cgroup (NUL fix, confirmed in zinit.slice/dbus.sv), ssh ok.
+- Chimera (musl, full tree): 74 supervised, ANOM=0, dbus bridge live,
+  elogind/polkitd up, device+zram correctly disabled, ssh ok (static
+  .15 on ens3; slirp hostfwd delivers to .15).
+- Void (glibc, minimal by construction — 3 dinit files): 6 supervised,
+  4 running, boot completed, ssh ok.
+- Alpine (musl, minimal hand staging): 5 supervised, serial+sshd up,
+  ssh ok, probe ran.
+Deploy lessons (all verified): new confs brick old sups (E008) —
+ship binary+staging together and reboot; ETXTBSY on install
+(rename-swap, incl. zdg itself); curl -s hides failures (always
+&&-chain + md5); holders must be `sleep infinity` (3600s ones die
+mid-session and qemu eats stdin EOF); MaxStartups self-DoS on
+repeated banner-timeout attempts (reboot clears); debugfs surgery
+only with qemu stopped + e2fsck after (page-cache divergence lies).
