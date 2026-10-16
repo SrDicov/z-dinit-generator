@@ -874,3 +874,10 @@ per-session manager, not system init).
   window from 23:15Z. Verdict due 2026-10-17 ~23:15Z.
 - GRUB default still 0 (dinit). Box booted zinit this time via manual menu
   pick at power-on. Default flip stays user decision post-soak.
+
+## P5 cold-boot flip (pending, user decision post-soak)
+- /boot/grub/grub.cfg has exactly 2 top-level entries: 0 = Chimera Linux
+  (dinit), 1 = Chimera Linux (zinit). /etc/default/grub: GRUB_DEFAULT=0.
+- Flip = `GRUB_DEFAULT=1` in /etc/default/grub + regenerate grub.cfg
+  (Chimera: `grub-mkconfig -o /boot/grub/grub.cfg`), then one cold boot
+  to verify PID1=zinit without one-shot. DO NOT do before soak verdict.
