@@ -25,9 +25,10 @@ sudo reboot                     # con el bootloader ya en init=/sbin/zinit
 
 - `unload`, `shutdown`/`reboot`/`halt`/`poweroff`, `untrigger`: NAK
   honesto, no hay contraparte (sin power path por diseño).
-- Sin demand-start: un `depends` a un servicio `enabled = no` lo deja
-  en espera; no lo arranca (dinit sí lo haría). `zctl start` manual
-  converge; documentado en `KNOWN_ISSUES.md` de zinit.
+- Demand-start: implementado para dependencias declaradas a servicios
+  `enabled = no`: se activan automáticamente cuando el dependiente
+  realmente corre (mirrors dinit `depends-on`). Servicios explicitamente
+  parados por el operador (`zctl stop`) nunca se reactivan.
 - `type = scripted` con protocolo start/stop → `oneshot` (el script
   corre una vez; sin comandos stop persistentes).
 - `before:`/`after:` de dinit → ignorados con aviso; el orden zinit
