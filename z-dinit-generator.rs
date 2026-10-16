@@ -1686,7 +1686,7 @@ struct DctlOpts {
 }
 
 fn dctl_usage() -> i32 {
-    eprintln!("usage: dinitctl [options] <start|stop|status|list|restart|wake|release|unpin|unload|reload|shutdown|add-dep|rm-dep|enable|disable|trigger|untrigger|setenv|unsetenv|is-started|is-failed|catlog|signal> [...]");
+    eprintln!("usage: dinitctl [options] <start|stop|status|list|restart|wake|release|unpin|unload|reload|shutdown|reboot|poweroff|halt|add-dep|rm-dep|enable|disable|trigger|untrigger|setenv|unsetenv|is-started|is-failed|catlog|signal> [...]");
     1
 }
 
@@ -1951,11 +1951,24 @@ fn cmd_dinitctl_sock(args: &[String], sock_override: Option<&str>) -> i32 {
             if !rest.is_empty() {
                 return dctl_usage();
             }
-            // dinitctl shutdown stops everything and powers off.
-            if graceful_shutdown(&sock, "/proc/sysrq-trigger", Some(b'o')) {
+            // dinitctl shutdown stops everything and powers off, through
+            // the supervisor like everything else power-shaped.
+            if z_power(&sock, "poweroff") {
                 0
             } else {
                 warn("shutdown failed".to_string());
+                1
+            }
+        }
+        "reboot" | "poweroff" | "halt" => {
+            if !rest.is_empty() {
+                return dctl_usage();
+            }
+            let verb = cmd.as_str();
+            if z_power(&sock, verb) {
+                0
+            } else {
+                warn(format!("{verb} failed"));
                 1
             }
         }
@@ -2273,6 +2286,16 @@ fn z_act(sock: &str, verb: &str, name: &str) -> bool {
         return false;
     }
     match c4_ask(sock, &format!("C compatd {verb} {name}\n")) {
+        Some(r) => r.starts_with("R "),
+        None => false,
+    }
+}
+
+/// Ask the supervisor to act on the whole machine (no service argument).
+/// `true` iff it answered success. Power lives in the supervisor now
+/// (orderly stop-all + deadline + breadcrumb); compatd only translates.
+fn z_power(sock: &str, verb: &str) -> bool {
+    match c4_ask(sock, &format!("C compatd {verb}\n")) {
         Some(r) => r.starts_with("R "),
         None => false,
     }
@@ -2708,14 +2731,18 @@ fn serve_one(s: &mut UnixStream, handles: SharedHandles, ctx: &Ctx) {
             SHUTDOWN => {
                 // Shutdown types: REMAIN 1, HALT 2, POWEROFF 3, REBOOT 4,
                 // SOFTREBOOT 5, KEXEC 6. Anything else is BADREQ upstream.
+                // Power verbs go through the supervisor (orderly stop-all +
+                // deadline + breadcrumb); only REMAIN keeps the local loop,
+                // and SOFTREBOOT/KEXEC stay NAKed: there is no counterpart.
                 let mut b = [0u8; 1];
                 if !rd_n(s, &mut b) {
                     return;
                 }
-                let letter = match b[0] {
+                let verb = match b[0] {
                     1 => None,
-                    2 | 3 => Some(b'o'),
-                    4 => Some(b'b'),
+                    2 => Some("halt"),
+                    3 => Some("poweroff"),
+                    4 => Some("reboot"),
                     5 | 6 => {
                         if !wr_all(s, &[NAK]) {
                             return;
@@ -2724,7 +2751,17 @@ fn serve_one(s: &mut UnixStream, handles: SharedHandles, ctx: &Ctx) {
                     }
                     _ => badreq!(),
                 };
-                if graceful_shutdown(&ctx.zsock, &ctx.sysrq, letter) {
+                if let Some(v) = verb {
+                    if z_power(&ctx.zsock, v) {
+                        if !wr_all(s, &[ACK]) {
+                            return;
+                        }
+                    } else if !wr_all(s, &[NAK]) {
+                        return;
+                    }
+                    continue;
+                }
+                if graceful_shutdown(&ctx.zsock, &ctx.sysrq, None) {
                     if !wr_all(s, &[ACK]) {
                         return;
                     }
@@ -3152,8 +3189,19 @@ fn serve_one(s: &mut UnixStream, handles: SharedHandles, ctx: &Ctx) {
 /// `b` reboot). HALT maps to `o`: sysrq cannot halt without cutting
 /// power (documented divergence). There is no graceful path for
 /// SOFTREBOOT/KEXEC: the caller must NAK those.
-fn graceful_shutdown(zsock: &str, sysrq_path: &str, letter: Option<u8>) -> bool {
-    let list = z_list(zsock).unwrap_or_default();
+/// Last-resort power for the CLI verbs when no supervisor answers: sync,
+/// then the sysrq letter. Loud about which path it took: a silent fallback
+/// here would turn "the supervisor is down" into an unorderly power cut
+/// with no testimony.
+fn sysrq_power(letter: u8, verb: &str) -> bool {
+    warn(&format!(
+        "{verb}: no supervisor answered, falling back to sysrq (no orderly stop)"
+    ));
+    let _ = std::process::Command::new("sync").status();
+    std::fs::write("/proc/sysrq-trigger", [letter]).is_ok()
+}
+
+fn graceful_shutdown(zsock: &str, sysrq_path: &str, letter: Option<u8>) -> bool {    let list = z_list(zsock).unwrap_or_default();
     let mut ok = true;
     for (name, state) in &list {
         if z_state_tok(state) == ST_STOPPED {
@@ -3408,7 +3456,9 @@ fn main() -> std::process::ExitCode {
             if !args.is_empty() {
                 eprintln!("usage: z-dinit-generator {verb}");
                 2
-            } else if graceful_shutdown(&zinit_socket(None), "/proc/sysrq-trigger", Some(b'o')) {
+            } else if z_power(&zinit_socket(None), "poweroff") {
+                0
+            } else if sysrq_power('o', verb) {
                 0
             } else {
                 eprintln!("z-dinit-generator: {verb} failed");
@@ -3419,7 +3469,9 @@ fn main() -> std::process::ExitCode {
             if !args.is_empty() {
                 eprintln!("usage: z-dinit-generator reboot");
                 2
-            } else if graceful_shutdown(&zinit_socket(None), "/proc/sysrq-trigger", Some(b'b')) {
+            } else if z_power(&zinit_socket(None), "reboot") {
+                0
+            } else if sysrq_power('b', verb) {
                 0
             } else {
                 eprintln!("z-dinit-generator: reboot failed");
@@ -4049,6 +4101,13 @@ mod tests {
                     } else if w.len() >= 3 && w[2] == "reload-all" {
                         reloaded.store(true, Ordering::SeqCst);
                         "R compatd 0\n"
+                    } else if w.len() >= 3
+                        && (w[2] == "poweroff"
+                            || w[2] == "reboot"
+                            || w[2] == "halt"
+                            || w[2] == "suspend")
+                    {
+                        "R compatd 0\n"
                     } else {
                         "E compatd 2 bad verb\n"
                     };
@@ -4356,10 +4415,14 @@ mod tests {
         assert_eq!(dctl(&zsock, &["is-started", "a"]), 0);
         assert_eq!(dctl(&zsock, &["is-started", "b"]), 1);
         assert_eq!(dctl(&zsock, &["is-failed", "b"]), 1);
-        // loud refusals last: shutdown stops the stub services as a side
-        // effect, so nothing stateful may follow it in this test.
+        // loud refusals last (unload/untrigger keep refusing); shutdown now
+        // asks the supervisor instead of driving sysrq itself, so it
+        // succeeds against the stub (and stops nothing locally).
         assert_eq!(dctl(&zsock, &["unload", "a"]), 1);
-        assert_eq!(dctl(&zsock, &["shutdown"]), 1);
+        assert_eq!(dctl(&zsock, &["shutdown"]), 0);
+        assert_eq!(dctl(&zsock, &["reboot"]), 0);
+        assert_eq!(dctl(&zsock, &["poweroff"]), 0);
+        assert_eq!(dctl(&zsock, &["halt"]), 0);
         assert_eq!(dctl(&zsock, &["untrigger", "a"]), 1);
     }
 
@@ -4446,6 +4509,33 @@ mod tests {
         assert_eq!(st[2], ST_STOPPED);
         client.write_all(&[SHUTDOWN, 5]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn compatd_shutdown_power_verbs_ask_the_supervisor() {
+        // HALT/POWEROFF/REBOOT no longer touch sysrq: they ask the
+        // supervisor (orderly stop-all + deadline + breadcrumb) and ACK
+        // iff it answers R. The stub answers R to power verbs, so ACK here
+        // proves the C4 round trip; unprivileged runners NAKed before.
+        let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (zsock, _stub) = stub(reloaded);
+        let out = tmpout("shutpower");
+        let sysrq = tmpout("shutpower-sys").join("sysrq");
+        let ctx = Ctx {
+            outdir: out,
+            zsock,
+            sysrq: sysrq.display().to_string(),
+        };
+        let (server, mut client) = pair();
+        let h = serve_bg(server, BTreeMap::new(), ctx, 97);
+        for t in [2u8, 3, 4] {
+            client.write_all(&[SHUTDOWN, t]).unwrap();
+            assert_eq!(read_exact(&mut client, 1), [ACK], "type {t}");
+        }
+        // No sysrq writes anywhere on this path, even offered.
+        assert!(!sysrq.exists());
         drop(client);
         h.join().unwrap();
     }

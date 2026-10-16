@@ -26,8 +26,8 @@ with open(os.path.join(OUT, "b.conf"), "w") as f:
 STUB = os.path.join(TMP, "c4.sock")
 DSOCK = os.path.join(TMP, "dinitctl")
 reloaded = []
-# NOTE: never run this as root: the SHUTDOWN case writes the real
-# /proc/sysrq-trigger (CI runners are unprivileged, so it NAKs there).
+# NOTE: power verbs go through the stub supervisor (C4), never sysrq, so
+# this e2e is root-safe: the worst a power verb does here is an ACK.
 stopped = {"b"}
 lag_used = [False]
 
@@ -91,6 +91,8 @@ def stub_server():
                         rep = "R compatd 0\n"
                 elif len(w) >= 3 and w[2] == "reload-all":
                     reloaded.append(1)
+                    rep = "R compatd 0\n"
+                elif len(w) >= 3 and w[2] in ("poweroff", "reboot", "halt", "suspend"):
                     rep = "R compatd 0\n"
                 else:
                     rep = "E compatd 2 bad\n"
@@ -275,6 +277,12 @@ try:
     check("listenenv", c2.read(1) == bytes([50]))
     c2.raw(bytes([10, 4]))
     check("shutdown", c2.read(1) == bytes([51]))
+    c2.raw(bytes([10, 2]))
+    check("shutdown-halt", c2.read(1) == bytes([50]))
+    c2.raw(bytes([10, 3]))
+    check("shutdown-poweroff", c2.read(1) == bytes([50]))
+    c2.raw(bytes([10, 4]))
+    check("shutdown-reboot", c2.read(1) == bytes([50]))
     # 19. handle uniqueness across connections (close idle first:
     # one connection is served at a time, like upstream).
     c2.close()
@@ -291,6 +299,6 @@ try:
     if fails:
         print("FAILURES: %s" % fails)
         sys.exit(1)
-    print("proto: %d checks ok" % 40)
+    print("proto: %d checks ok" % 43)
 finally:
     proc.terminate()

@@ -23,8 +23,9 @@ sudo reboot                     # con el bootloader ya en init=/sbin/zinit
 
 ## Límites (lo que no traduce / no hace)
 
-- `unload`, `shutdown`/`reboot`/`halt`/`poweroff`, `untrigger`: NAK
-  honesto, no hay contraparte (sin power path por diseño).
+- `unload`, `untrigger`, `SOFTREBOOT`, `KEXEC`, `hibernate`: NAK honesto,
+  no hay contraparte. `shutdown`/`reboot`/`halt`/`poweroff` SÍ actúan:
+  van al supervisor (stop-all ordenado + deadline + breadcrumb).
 - Demand-start: implementado para dependencias declaradas a servicios
   `enabled = no`: se activan automáticamente cuando el dependiente
   realmente corre (mirrors dinit `depends-on`). Servicios explicitamente
