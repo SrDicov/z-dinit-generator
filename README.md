@@ -10,11 +10,30 @@ dependencias. Dos modos:
 
 ```sh
 sudo pacman -S zinit z-dinit-generator
-sudo z-dinit-generator start
-sudo pacman -R dinit
-sudo reboot
-# todo sigue funcional: zinit como PID 1, dinitctl responde, devmon callado
+sudo z-dinit-generator start   # convierte + compatd/watch
+sudo zinit --sup /etc/zinit/services.d &   # supervisa junto a dinit
+# paridad: todo nombre en `dinitctl list` (capturado ANTES) existe en `zctl list`
+# 30 min estables, 0 failed; luego la ventana (sin rollback con estado):
+sudo pacman -Rdd dinit          # quita el binario; el PID 1 sigue en RAM
+# libera los puertos (dinitctl real vía SIGUSR1 si compatd tomó el socket),
+# `dinitctl stop boot`, deja que zinit tome sshd/dbus, 1h de ventana
+sudo reboot                     # con el bootloader ya en init=/sbin/zinit
+# zinit como PID 1, dinitctl responde vía compatd, resto funcional
 ```
+
+## Límites (lo que no traduce / no hace)
+
+- `unload`, `shutdown`/`reboot`/`halt`/`poweroff`, `untrigger`: NAK
+  honesto, no hay contraparte (sin power path por diseño).
+- Sin demand-start: un `depends` a un servicio `enabled = no` lo deja
+  en espera; no lo arranca (dinit sí lo haría). `zctl start` manual
+  converge; documentado en `KNOWN_ISSUES.md` de zinit.
+- `type = scripted` con protocolo start/stop → `oneshot` (el script
+  corre una vez; sin comandos stop persistentes).
+- `before:`/`after:` de dinit → ignorados con aviso; el orden zinit
+  vive en `depends =` (+ `after:` solo-orden propio, otra semántica).
+- `runs-on-console`, `starts-log`: aceptados, no modelados.
+- OpenRC/systemd: fuera de alcance (solo dinit in, zinit out).
 
 Texto dentro, texto fuera para convertir; demonio silencioso para vigilar:
 
