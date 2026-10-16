@@ -791,3 +791,26 @@ sup runs alongside dinit (pid 1458, adopted by 1), 8-9 running, 0 failed.
   Chimera default PATH skips /usr/local/bin — bare dinitctl still hits
   /usr/bin; use full shim path. Next: v7 session + child-death fix, then
   grub one-shot PID1 test with operator present.
+
+## 2026-10-16 — PID1 retest green + chronyd pipefd fix (real HW)
+
+Second one-shot boot (grub-reboot, default untouched): PID1=zinit in 15s,
+22 running / 74 stopped, 0 failed. WiFi up (iwd statically enabled before
+the boot after proving the closure left it down), sshd/NM/tailscaled/
+elogind/dbus all restarts=0, gettys healthy, user dinit session + desktop
+alive (`dinit --user` is the remaining dinit process — correct, it is the
+per-session manager, not system init).
+
+- FIX 6595dee (this push): `ready-notification = pipefd:N` with N>=10 no
+  longer emits `exec N>&$ZINIT_NOTIFY_FD`. That prefix is a syntax wall on
+  busybox ash (`exec: 11: not found`) — chronyd looped 160+ restarts with
+  an empty log as only evidence. When N travels as a standalone arg
+  (`-N 11`), it becomes `-N $ZINIT_NOTIFY_FD` (sup hands fd 3; verified
+  `chronyd -n ... -N 3` running + `chronyc tracking` Stratum 3). Single-
+  digit dance unchanged (e2e pins it). Bisected live: log=file + notify +
+  fixed-fd redirect was the exact trigger trio.
+- NNP fix (zinit 273886b, CI green, deployed, proven live): compatd shows
+  NoNewPrivs:0, new ssh sessions NNP=0, `doas` works under zinit PID1.
+  The lockout is over.
+- chronyd restarts counter is historical (300); process stable since fix.
+- Box hygiene: strace removed (715 pkgs), /tmp scrubbed, scratch sup gone.
