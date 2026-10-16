@@ -1281,11 +1281,33 @@ fn cmd_convert_dirs(dirs: &[std::path::PathBuf], out_dir: &std::path::Path) -> i
             if !closed.contains(&svc) {
                 let p = out_dir.join(&fname);
                 let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
+                // Only manage what convert generated (this run) or already
+                // managed (carries an `enabled =` line): operator-owned
+                // seasoning (net, probe, local services) is left exactly
+                // as written, or every convert would disable the machine's
+                // own files. A sourceless file we never touched gets one
+                // loud warn telling the operator to remove it or pin it
+                // with `enabled = no` — visible, reversible, no data loss.
+                // Any present `enabled =` line (yes or no) is respected as
+                // the operator's pin: appending another is fatal E005.
+                let has_enabled = cur.lines().any(|l| {
+                    let t = l.trim();
+                    t == "enabled = no" || t == "enabled = yes"
+                });
+                if has_enabled {
+                    continue;
+                }
+                let generated = converted.iter().any(|c| c.name == svc);
+                if !generated {
+                    warns.push(format!(
+                        "{svc}: no dinit source, left alone (remove it or pin enabled = no)"
+                    ));
+                    continue;
+                }
                 // Idempotent: re-running convert (or `start`) over its own
                 // output must not stack another `enabled = no` — a duplicate
                 // directive is fatal E005 at load and bricks the boot.
-                let has = cur.lines().any(|l| l.trim() == "enabled = no");
-                if !has {
+                {
                     if !cur.ends_with('\n') && !cur.is_empty() {
                         cur.push('\n');
                     }
@@ -3549,6 +3571,40 @@ mod tests {
         assert!(
             !got.contains("enabled = no"),
             "cross-layer dep must survive single-file reconvert:\n{got}"
+        );
+    }
+
+    #[test]
+    fn operator_seasoning_survives_convert() {
+        // Files convert did not generate are not its business: no
+        // `enabled = no` may land on them, with or without a pin. A
+        // sourceless file without a pin gets one loud warn instead.
+        let src = tmpout("seas-src");
+        let out = tmpout("seas-out");
+        std::fs::write(src.join("boot"), "type = internal\n").unwrap();
+        std::fs::write(
+            out.join("net.conf"),
+            "type = oneshot\ncommand = /sbin/net.sh\nrestart = never\nlog = none\nready = none\n",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("probe.conf"),
+            "type = oneshot\ncommand = /bin/probe\nrestart = never\nlog = none\nready = none\nenabled = no\n",
+        )
+        .unwrap();
+        let out2 = out.clone();
+        let rc = cmd_convert(&src, &out2);
+        assert_eq!(rc, 0);
+        let net = std::fs::read_to_string(out.join("net.conf")).unwrap();
+        assert!(
+            !net.contains("enabled"),
+            "operator file untouched:\n{net}"
+        );
+        let probe = std::fs::read_to_string(out.join("probe.conf")).unwrap();
+        assert_eq!(
+            probe.matches("enabled = no").count(),
+            1,
+            "pinned file not stacked:\n{probe}"
         );
     }
 
