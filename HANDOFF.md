@@ -488,7 +488,6 @@ with the chain intact (udevd/tmpfiles/sysusers/pre-local all stay
 enabled). The 00:18 mtime dust was my own sed + old-watch writes.
 
 ## 2026-10-15 — proof9: sysusers race 3/3, VM left healthy
-
 Fresh cold boot with the fixed watch live: staging intact, but
 `sysusers` suppressed at boot again (3/3) and the network subtree
 gated. `kick` recovered everything (sshd running). VM left up with
@@ -551,3 +550,32 @@ carries the pre-exec step (0 = refused before fork) and the sup
 announces `child failed at <step> (<err>)` — `poll_exec` used to
 discard the step word. Same session also fixed `reconvert_and_reload`
 (single-parent converts decimated like the old watch).
+
+## 2026-10-16 — Chimera leg closed (cold boot, ANOM=0)
+
+Musl unfreezed (CI artifacts now ship musl zinit+zctl; static musl
+zdg via local rustc): cold boot, 13 running, ssh, dbus bridge live
+(org.chimera.dinit on the bus), elogind/polkitd up, device+zram
+correctly disabled (nothing pulls them; dinit would not start them
+either). Fixes, all proven live:
+- `dbus-daemon --dinit` binds nothing (waits PID-1 activation):
+  strip the whole-token flag, daemon binds itself, bus socket appears.
+- `dinit-dbus` without DINIT_CS_FD exits at once: map
+  `options: pass-cs-fd` to `-S /run/dinitctl` (compatd default).
+- compatd `dep_add` wrote edges to ghosts: dinit-dbus pinned an
+  unmaterialized agetty-service@ttyS0 and the sup fatalled the whole
+  boot (offline debugfs surgery to recover). Now: names validated,
+  missing non-instances NAKed, base@arg synthesized from the base
+  template. (Sup-global-fatal on dangling required stays an open
+  product decision; dinit tolerates per-service.)
+- disable pass only manages generated-or-pinned files now: seasoning
+  (net, probe, local services) is left alone with one loud warn
+  instead of being disabled every convert.
+- net.sh is dual-iface (ens3 after rename, eth0 before): udevd
+  renames eth0→ens3 after boot, so early-boot static config must try
+  both; slirp hostfwd delivers to .15 (its default guest IP).
+Lessons: ETXTBSY on install (rename-swap), sshd children pile up to
+MaxStartups on repeated banner-timeout attempts (self-DoS, reboot to
+clear), serial console login never worked here (ssh-key only; root
+password unknown, empty rejected — debugfs shadow edits need a
+reboot to be seen, page cache).
