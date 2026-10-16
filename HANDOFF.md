@@ -755,3 +755,39 @@ NEXT SESSION, in order:
 3. Soak 24h interrupted (4 points, slope -21.1, no verdict). Relaunch
    from zero, frozen binary, hourly sampling, no gaps.
 4. Beta tag waits on soak verdict + Chimera P2.
+
+## 2026-10-16 — live Chimera install (real HW, 192.168.1.3) + closure fix
+
+Deployed CI-green musl zinit+zctl + std-only zdg (recompiled musl static;
+glibc-dynamic first build refused by musl, caught at exec, not at scp).
+`zdg start` converted 76 dinit names -> 90 confs, `zinit check` exit 0,
+sup runs alongside dinit (pid 1458, adopted by 1), 8-9 running, 0 failed.
+
+- FIX 47e8949 (CI green): absolute `waits-for.d/depends-on.d` path wins
+  over in_dir+basename. Chimera boot's `waits-for.d: /etc/dinit.d/boot.d`
+  was read as /usr/lib/dinit.d/boot.d (decoys), wrongly disabling
+  sshd/networkmanager/tailscaled/agetty/zram-swap. Live proof: reconvert
+  cleared all three (0 `enabled = no`), 21 disabled remain, of which only
+  bluetoothd/rtkit/power-profiles-daemon are dinit-started with no static
+  edge (runtime-activated, PID1 gap, documented not fixed).
+- v7 hang, new evidence (extends line 358): real dinitctl 0.22.0
+  `is-started/status` vs compatd socket hang, RC=124 twice. zdg shim
+  answers instantly. Root cause is the v7 handshake/framing, still needs
+  the focused protocol session. Side effect: zinit's agetty oneshot ran
+  /usr/lib/dinit-agetty whose foreground `dinitctl add-dep` hung 25 min
+  (leaf, boot unaffected); stopped + cleaned, ps CLEAN.
+- Synthesis+wake PROVEN live via shim: add-dep synthesized
+  agetty-service@tty1.conf, wake spawned pid 3899 on free tty1. BUT the
+  child died instantly and silently (empty log, no output) while sup kept
+  reporting Running pid=3899, restarts 0/3 — stale-pid fast-death, needs
+  zinit-side root cause (track race class). %i expansion itself is fine
+  (parser expands from filename). Test state fully reverted
+  (agetty.conf edge removed, synthesized conf deleted, reload-all).
+- NO PID1 flip today: console (agetty), v7 clients, and BT/audio
+  activation all need the two fixes above first. Box left in stable
+  coexistence: dinit PID1 + all its pids intact (sshd 442, NM 438,
+  tailscaled 441, elogind 464, gettys), zinit supervising 90 alongside.
+  /usr/local/bin/dinitctl shim installed (= upstream packaging) but
+  Chimera default PATH skips /usr/local/bin — bare dinitctl still hits
+  /usr/bin; use full shim path. Next: v7 session + child-death fix, then
+  grub one-shot PID1 test with operator present.
