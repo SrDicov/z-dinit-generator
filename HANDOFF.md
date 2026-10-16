@@ -707,3 +707,32 @@ then P2 (qemu relaunch without init=, PID1=zinit expected).
 Packaging fixes pushed: dinitctl shim untracked (post_install),
 co-installable, no provides (would forbid P1); zinit PKGBUILD added.
 Release smoke dispatched (run 38871921962).
+
+## 2026-10-16 — A/B/C/D closed (afternoon)
+
+- A (soak numbers): R1 1381 vs R2 1297 was VM-confusion, not a leak.
+  Same-VM series (sup=71): 1381 -> 1297 -> 1309 -> 1209 kB, fds 91 ->
+  94 flat, threads 1, zombies 0, census 17 -> 19 (two manual getty
+  starts, then stable). Linear slope -21.1 kB/h over 6.7h: no leak,
+  allocator noise. Curve with header in matrix/soak-curve.tsv.
+  The "+15 kB/h" was a cherry-picked pair; struck from the record.
+- B (P2 per distro): Alpine + Void verified bootloader-default (no
+  init= in cmdline, /sbin/init flipped offline, PID1=zinit, 0 failed,
+  0 zombies) + orderly TERM-sup shutdown with 0 zombies/0 running/
+  0 failed post-state read offline (measurement script only remains).
+  Serial logs: matrix/p2-alpine.log, p2-void.log, p2-chim2.log.
+  Chimera: boot proven (console login + supervising 74) but ssh RST
+  persists and serial password unknown, so its shutdown test is
+  BLOCKED (same stop-all mechanism + binary family as the three
+  proven legs; chase post-beta).
+- C (35 disabled, Artix): 25 not-loaded-by-dinit (parity) + 7 console
+  gettys (dinit-started, demand-mitigated) + 3 zinit-native (probe
+  artifact). Zero user-expected-active missing (net via dhcpcd,
+  cron, ssh, metalog all STARTED both sides). matrix/disabled-artix.md.
+- D (demand-start): runtime CLOSED and live-proven (P1 binary
+  c11f5fee: getty@tty6 enabled=no on disk, running from boot,
+  agetty completed, zero manual starts). Generator still emits
+  enabled=no BY DESIGN (boot-default model); no generator change
+  needed or pending. The acta's "consolidacion" line was wrong.
+- Demand test fixed twice (Display->plain, one-pass->dep-first
+  two-pass: puller honors dep gate until Running). CI green b086057.
