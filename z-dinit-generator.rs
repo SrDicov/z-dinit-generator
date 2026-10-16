@@ -2334,6 +2334,7 @@ fn valid_proto_name(n: &[u8]) -> bool {
     !n.is_empty() && n[0] != b'.' && n[0] != b'@'
 }
 
+#[derive(Clone)]
 struct Ctx {
     outdir: std::path::PathBuf,
     zsock: String,
@@ -2419,43 +2420,47 @@ fn dep_token(dtype: u8, to: &str) -> Option<String> {
     }
 }
 
-// Serve one client until EOF, error or protocol violation. Returns the
-// next handle value so handles stay unique across the process lifetime.
+// Serve one client until EOF, error or protocol violation. Handles are
+// unique across connections via the shared counter; each connection
+// keeps its own handle->name table (like dinit itself).
 fn serve_one(
     s: &mut UnixStream,
-    mut next_handle: u32,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
     names: &mut BTreeMap<u32, String>,
     ctx: &Ctx,
-) -> u32 {
+) {
+    // One thread per connection (see cmd_compatd): a silent holder must
+    // never wedge the next client, so handles stay unique across threads
+    // via the shared counter while each connection keeps its own names.
     // BADREQ closes the connection, like control.cc (bad_conn_close).
     macro_rules! badreq {
         () => {{
             let _ = wr_all(s, &[BADREQ]);
-            return next_handle;
+            return;
         }};
     }
     loop {
         let mut t = [0u8; 1];
         if !rd_n(s, &mut t) {
-            return next_handle;
+            return;
         }
         match t[0] {
             QUERYVERSION => {
                 if !wr_all(s, &VER_REPLY) {
-                    return next_handle;
+                    return;
                 }
             }
             FINDSERVICE | LOADSERVICE => {
                 let len = match rd_u16(s) {
                     Some(l) => l,
-                    None => return next_handle,
+                    None => return,
                 };
                 if len == 0 || len > 1021 {
                     badreq!();
                 }
                 let mut name = vec![0u8; len as usize];
                 if !rd_n(s, &mut name) {
-                    return next_handle;
+                    return;
                 }
                 if !valid_proto_name(&name) {
                     badreq!();
@@ -2463,14 +2468,15 @@ fn serve_one(
                 let svc = String::from_utf8_lossy(&name).into_owned();
                 match z_status(&ctx.zsock, &svc) {
                     Some(st) => {
+                        let id = counter
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let mut reply = [SERVICERECORD, 0, 0, 0, 0, 0, 0];
                         reply[1] = st.state;
-                        reply[2..6].copy_from_slice(&next_handle.to_le_bytes());
+                        reply[2..6].copy_from_slice(&id.to_le_bytes());
                         reply[6] = st.target;
-                        names.insert(next_handle, svc);
-                        next_handle += 1;
+                        names.insert(id, svc);
                         if !wr_all(s, &reply) {
-                            return next_handle;
+                            return;
                         }
                     }
                     None => {
@@ -2499,32 +2505,36 @@ fn serve_one(
                                         }
                                     }
                                     if let Some(st) = z_status(&ctx.zsock, &svc) {
+                                        let id = counter.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
                                         let mut reply =
                                             [SERVICERECORD, 0, 0, 0, 0, 0, 0];
                                         reply[1] = st.state;
                                         reply[2..6].copy_from_slice(
-                                            &next_handle.to_le_bytes(),
+                                            &id.to_le_bytes(),
                                         );
                                         reply[6] = st.target;
-                                        names.insert(next_handle, svc);
-                                        next_handle += 1;
+                                        names.insert(id, svc);
                                         served = wr_all(s, &reply);
                                         if !served {
-                                            return next_handle;
+                                            return;
                                         }
                                     }
                                 }
                             }
                             if !served && !wr_all(s, &[NOSERVICE]) {
-                                return next_handle;
+                                return;
                             }
                         } else {
+                            let id = counter
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let mut reply = [SERVICERECORD, 2, 0, 0, 0, 0, 2];
-                            reply[2..6].copy_from_slice(&next_handle.to_le_bytes());
-                            names.insert(next_handle, svc);
-                            next_handle += 1;
+                            reply[2..6].copy_from_slice(&id.to_le_bytes());
+                            names.insert(id, svc);
                             if !wr_all(s, &reply) {
-                                return next_handle;
+                                return;
                             }
                         }
                     }
@@ -2535,7 +2545,7 @@ fn serve_one(
                 // restart-after-stop, bit7 pre-ack.
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 let name = match names.get(&handle).cloned() {
@@ -2543,7 +2553,7 @@ fn serve_one(
                     None => badreq!(),
                 };
                 if rest[0] & 128 != 0 && !wr_all(s, &[PREACK]) {
-                    return next_handle;
+                    return;
                 }
                 // pin (bit0) has no counterpart: start/stop covers it.
                 // gentle (bit1) cannot enumerate dependents without the
@@ -2562,7 +2572,7 @@ fn serve_one(
                 };
                 if !z_act(&ctx.zsock, verb, &name) {
                     if !wr_all(s, &[NAK]) {
-                        return next_handle;
+                        return;
                     }
                     continue;
                 }
@@ -2572,12 +2582,12 @@ fn serve_one(
                         // daemon emits on transition, we emit on arrival.
                         emit_events(s, handle, if target == ST_STARTED { 0 } else { 1 }, &st);
                         if !wr_all(s, &[ALREADYSS]) {
-                            return next_handle;
+                            return;
                         }
                     }
                     _ => {
                         if !wr_all(s, &[ACK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -2586,14 +2596,14 @@ fn serve_one(
                 // No pin exists anywhere: unpinning always succeeds.
                 let mut rest = [0u8; 4];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes(rest);
                 if !names.contains_key(&handle) {
                     badreq!();
                 }
                 if !wr_all(s, &[ACK]) {
-                    return next_handle;
+                    return;
                 }
             }
             LISTSERVICES | LISTSERVICES5 => {
@@ -2602,7 +2612,7 @@ fn serve_one(
                     Some(l) => l,
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2624,24 +2634,24 @@ fn serve_one(
                     pkt.extend_from_slice(&buf);
                     pkt.extend_from_slice(&nb[..nl]);
                     if !wr_all(s, &pkt) {
-                        return next_handle;
+                        return;
                     }
                 }
                 if !wr_all(s, &[LISTDONE]) {
-                    return next_handle;
+                    return;
                 }
             }
             UNLOADSERVICE => {
                 // Descriptions live in files; nothing transient to unload.
                 let mut rest = [0u8; 4];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 if !names.contains_key(&u32::from_le_bytes(rest)) {
                     badreq!();
                 }
                 if !wr_all(s, &[NAK]) {
-                    return next_handle;
+                    return;
                 }
             }
             SHUTDOWN => {
@@ -2649,7 +2659,7 @@ fn serve_one(
                 // SOFTREBOOT 5, KEXEC 6. Anything else is BADREQ upstream.
                 let mut b = [0u8; 1];
                 if !rd_n(s, &mut b) {
-                    return next_handle;
+                    return;
                 }
                 let letter = match b[0] {
                     1 => None,
@@ -2657,7 +2667,7 @@ fn serve_one(
                     4 => Some(b'b'),
                     5 | 6 => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2665,10 +2675,10 @@ fn serve_one(
                 };
                 if graceful_shutdown(&ctx.zsock, &ctx.sysrq, letter) {
                     if !wr_all(s, &[ACK]) {
-                        return next_handle;
+                        return;
                     }
                 } else if !wr_all(s, &[NAK]) {
-                    return next_handle;
+                    return;
                 }
             }
             ADD_DEP | REM_DEP | ENABLESERVICE | ENABLE_SERVICE_V7 | REM_DEP_V7 => {
@@ -2678,7 +2688,7 @@ fn serve_one(
                 let adding = t[0] == ADD_DEP || t[0] == ENABLESERVICE || t[0] == ENABLE_SERVICE_V7;
                 let mut rest = [0u8; 9];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let from_h = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 let to_h = u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]);
@@ -2694,7 +2704,7 @@ fn serve_one(
                     Some(d) => d,
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2712,10 +2722,10 @@ fn serve_one(
                             let mut pkt = vec![SERVICESTATUSR, 1];
                             pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
                             if !wr_all(s, &pkt) {
-                                return next_handle;
+                                return;
                             }
                         } else if !wr_all(s, &[ACK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2725,7 +2735,7 @@ fn serve_one(
                         if let (Some(fs), Some(ts)) = (z_status(&ctx.zsock, &from), z_status(&ctx.zsock, &to)) {
                             if fs.state != ST_STOPPED && ts.state != ST_STARTED {
                                 if !wr_all(s, &[NAK]) {
-                                    return next_handle;
+                                    return;
                                 }
                                 continue;
                             }
@@ -2733,14 +2743,14 @@ fn serve_one(
                     }
                     if would_cycle(&ctx.outdir, &from, &to) {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
                     deps.push(tok);
                     if !write_depends(&ctx.outdir, &from, &deps) || c4_ask(&ctx.zsock, "C compatd reload-all\n").map(|r| !r.starts_with("R ")).unwrap_or(true) {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2763,10 +2773,10 @@ fn serve_one(
                         let mut pkt = vec![SERVICESTATUSR, 0];
                         pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
                         if !wr_all(s, &pkt) {
-                            return next_handle;
+                            return;
                         }
                     } else if !wr_all(s, &[ACK]) {
-                        return next_handle;
+                        return;
                     }
                 } else {
                     let had = deps.contains(&tok);
@@ -2774,7 +2784,7 @@ fn serve_one(
                         deps.retain(|d| d != &tok);
                         if !write_depends(&ctx.outdir, &from, &deps) || c4_ask(&ctx.zsock, "C compatd reload-all\n").map(|r| !r.starts_with("R ")).unwrap_or(true) {
                             if !wr_all(s, &[NAK]) {
-                                return next_handle;
+                                return;
                             }
                             continue;
                         }
@@ -2790,10 +2800,10 @@ fn serve_one(
                         let mut pkt = vec![SERVICESTATUSR, if had { 1 } else { 0 }];
                         pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &to)));
                         if !wr_all(s, &pkt) {
-                            return next_handle;
+                            return;
                         }
                     } else if !wr_all(s, &[if had { ACK } else { NAK }]) {
-                        return next_handle;
+                        return;
                     }
                 }
             }
@@ -2816,14 +2826,14 @@ fn serve_one(
                 pkt.extend_from_slice(&(db.len() as u32).to_le_bytes());
                 pkt.extend_from_slice(db);
                 if !wr_all(s, &pkt) {
-                    return next_handle;
+                    return;
                 }
             }
             QUERYSERVICENAME => {
                 // [cmd, reserved, handle]
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 match names.get(&handle) {
@@ -2835,12 +2845,12 @@ fn serve_one(
                         pkt.extend_from_slice(&(nb.len() as u16).to_le_bytes());
                         pkt.extend_from_slice(nb);
                         if !wr_all(s, &pkt) {
-                            return next_handle;
+                            return;
                         }
                     }
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -2848,7 +2858,7 @@ fn serve_one(
             RELOADSERVICE => {
                 let mut rest = [0u8; 4];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 if !names.contains_key(&u32::from_le_bytes(rest)) {
                     badreq!();
@@ -2858,12 +2868,12 @@ fn serve_one(
                 match c4_ask(&ctx.zsock, "C compatd reload-all\n") {
                     Some(r) if r.starts_with("R ") => {
                         if !wr_all(s, &[ACK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                     _ => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -2871,14 +2881,14 @@ fn serve_one(
             SETENV => {
                 let len = match rd_u16(s) {
                     Some(l) => l,
-                    None => return next_handle,
+                    None => return,
                 };
                 if len == 0 || len > 1021 {
                     badreq!();
                 }
                 let mut kv = vec![0u8; len as usize];
                 if !rd_n(s, &mut kv) {
-                    return next_handle;
+                    return;
                 }
                 // Accepted no-op (no activation environment exists — same
                 // contract as the dinitctl shim); malformed is BADREQ.
@@ -2886,7 +2896,7 @@ fn serve_one(
                     Some(0) | None => badreq!(),
                     Some(_) => {
                         if !wr_all(s, &[ACK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -2894,14 +2904,14 @@ fn serve_one(
             SERVICESTATUSQ | SERVICESTATUS5Q | SERVICESTATUS6Q => {
                 let mut rest = [0u8; 4];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes(rest);
                 let name = match names.get(&handle) {
                     Some(n) => n.clone(),
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
@@ -2920,7 +2930,7 @@ fn serve_one(
                     _ => pkt.extend_from_slice(&status_buf6(&st, conf_mtime(&ctx.outdir, &name))),
                 }
                 if !wr_all(s, &pkt) {
-                    return next_handle;
+                    return;
                 }
             }
             SETTRIGGER => {
@@ -2929,10 +2939,10 @@ fn serve_one(
                 // answers for a non-triggered service.
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 if !wr_all(s, &[NAK]) {
-                    return next_handle;
+                    return;
                 }
             }
             CATLOG => {
@@ -2940,7 +2950,7 @@ fn serve_one(
                 // else NAKs (dinit only serves BUFFER logs the same way).
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 let data = names
@@ -2962,12 +2972,12 @@ fn serve_one(
                         pkt.push(tail.len() as u8);
                         pkt.extend_from_slice(tail);
                         if !wr_all(s, &pkt) {
-                            return next_handle;
+                            return;
                         }
                     }
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -2978,7 +2988,7 @@ fn serve_one(
                 // KILLERR, matching the failure a real daemon would report.
                 let mut rest = [0u8; 8];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let signum = i32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
                 let handle = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
@@ -2986,14 +2996,14 @@ fn serve_one(
                     Some(n) => n.clone(),
                     None => {
                         if !wr_all(s, &[NAK]) {
-                            return next_handle;
+                            return;
                         }
                         continue;
                     }
                 };
                 if signum < 1 || signum > 64 {
                     if !wr_all(s, &[SIGNAL_BADSIG]) {
-                        return next_handle;
+                        return;
                     }
                     continue;
                 }
@@ -3001,7 +3011,7 @@ fn serve_one(
                 match pid {
                     None => {
                         if !wr_all(s, &[SIGNAL_NOPID]) {
-                            return next_handle;
+                            return;
                         }
                     }
                     Some(p) => {
@@ -3013,7 +3023,7 @@ fn serve_one(
                             .map(|st| st.success())
                             .unwrap_or(false);
                         if !wr_all(s, &[if ok { ACK } else { SIGNAL_KILLERR }]) {
-                            return next_handle;
+                            return;
                         }
                     }
                 }
@@ -3022,12 +3032,12 @@ fn serve_one(
                 // [cmd, spare, handle]: spare must be 0.
                 let mut rest = [0u8; 5];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let handle = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
                 if rest[0] != 0 || !names.contains_key(&handle) {
                     if !wr_all(s, &[NAK]) {
-                        return next_handle;
+                        return;
                     }
                     continue;
                 }
@@ -3038,13 +3048,13 @@ fn serve_one(
                 pkt.extend_from_slice(&(db.len() as u32).to_le_bytes());
                 pkt.extend_from_slice(db);
                 if !wr_all(s, &pkt) {
-                    return next_handle;
+                    return;
                 }
             }
             CLOSEHANDLE => {
                 let mut rest = [0u8; 4];
                 if !rd_n(s, &mut rest) {
-                    return next_handle;
+                    return;
                 }
                 let h = u32::from_le_bytes(rest);
                 if names.remove(&h).is_none() {
@@ -3052,13 +3062,13 @@ fn serve_one(
                     badreq!();
                 }
                 if !wr_all(s, &[ACK]) {
-                    return next_handle;
+                    return;
                 }
             }
             GETALLENV => {
                 let mut b = [0u8; 1];
                 if !rd_n(s, &mut b) {
-                    return next_handle;
+                    return;
                 }
                 if b[0] != 0 {
                     badreq!();
@@ -3068,7 +3078,7 @@ fn serve_one(
                 let mut pkt = vec![ALLENV];
                 pkt.extend_from_slice(&(0usize).to_le_bytes());
                 if !wr_all(s, &pkt) {
-                    return next_handle;
+                    return;
                 }
             }
             LISTENENV => {
@@ -3076,7 +3086,7 @@ fn serve_one(
                 // follows — the steady state stays silent, as observed
                 // against real dinit.
                 if !wr_all(s, &[ACK]) {
-                    return next_handle;
+                    return;
                 }
             }
             _ => {
@@ -3127,11 +3137,20 @@ fn cmd_compatd(path: &str, outdir: &std::path::Path) -> i32 {
         zsock: zinit_socket(None),
         sysrq: String::from("/proc/sysrq-trigger"),
     };
-    let mut next_handle = 0u32;
-    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    // One thread per connection: serve_one blocks in read until the client
+    // sends or disconnects, and a single-threaded loop lets one silent
+    // holder wedge every later client (live: stuck add-dep parked the
+    // loop, all later dinitctl hung with RC=124). Threads are std-only.
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     for conn in listener.incoming() {
-        if let Ok(mut s) = conn {
-            next_handle = serve_one(&mut s, next_handle, &mut names, &ctx);
+        if let Ok(s) = conn {
+            let counter = counter.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let mut s = s;
+                let mut names = BTreeMap::new();
+                serve_one(&mut s, counter, &mut names, &ctx);
+            });
         }
     }
     0
@@ -3867,7 +3886,9 @@ mod tests {
         std::thread::spawn(move || {
             let mut server = server;
             let mut names = names;
-            serve_one(&mut server, next, &mut names, &ctx);
+            let counter =
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(next));
+            serve_one(&mut server, counter, &mut names, &ctx);
         })
     }
 
@@ -4415,6 +4436,34 @@ mod tests {
         assert_eq!(read_exact(&mut client, 1), [BADREQ]);
         drop(client);
         h.join().unwrap();
+    }
+
+    #[test]
+    fn silent_holder_does_not_wedge_next_client() {
+        // Live 2026-10-16: a stuck `dinitctl add-dep` parked serve_one in
+        // read forever and every later v7 client hung (RC=124). One thread
+        // per connection: the silent holder keeps its thread, the next
+        // client still gets answers. pair() clients time out after 5 s, so
+        // the old sequential loop fails this test instead of hanging CI.
+        let (s1, c1) = pair();
+        let (s2, mut c2) = pair();
+        let h1 = serve_bg(s1, BTreeMap::new(), fctx(), 0);
+        let h2 = serve_bg(s2, BTreeMap::new(), fctx(), 1000);
+        // c1 holds silently: connected, never writes, never EOFs.
+        c2.write_all(&[QUERYVERSION]).unwrap();
+        assert_eq!(read_exact(&mut c2, 5), VER_REPLY);
+        let name = b"zzz-no-such-svc";
+        let mut q = vec![FINDSERVICE, name.len() as u8, 0];
+        q.extend_from_slice(name);
+        c2.write_all(&q).unwrap();
+        // No sup at the fixture socket: canned STARTED record, first byte
+        // SERVICERECORD either way (never a hang, never NOSERVICE here).
+        let reply = read_exact(&mut c2, 1);
+        assert_eq!(reply, vec![SERVICERECORD]);
+        drop(c1);
+        drop(c2);
+        h1.join().unwrap();
+        h2.join().unwrap();
     }
 
     #[test]
