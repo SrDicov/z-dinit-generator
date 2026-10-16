@@ -881,3 +881,14 @@ per-session manager, not system init).
 - Flip = `GRUB_DEFAULT=1` in /etc/default/grub + regenerate grub.cfg
   (Chimera: `grub-mkconfig -o /boot/grub/grub.cfg`), then one cold boot
   to verify PID1=zinit without one-shot. DO NOT do before soak verdict.
+
+## 2026-10-16 ~19:30Z — P2.3 closed, box clean
+- Stale-pid directed session: phase 1 (10k polls on self-cycling
+  /bin/true): 40 raw hits, all up=0s. Phase 2 (3k polls, 0.3s
+  re-confirmation of same-pid-still-Running): TRUE_STALE=0, raced=9.
+  Verdict: no stuck records; phase-1 hits were sampler race against a
+  hyper-cycling probe. With zero forking services in plan + CI green,
+  the hold-window hypothesis is discarded (reopen if a stuck Running +
+  dead pid with up>0s ever reappears). Cleanup done: staleprobe + logs
+  removed, plan back to 97 (24 running / 73 stopped / 0 failed), 0 zombies.
+- chronyd: 13+ min running, restarts pinned at 0/3 on the new binary.
