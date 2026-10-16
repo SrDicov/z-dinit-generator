@@ -879,6 +879,38 @@ fn convert_one(
             w!("--print-address dropped: print-and-exit cannot supervise; daemon runs foreground with ready = none".to_string());
             ready = "none".to_string();
             notifyfd.clear();
+        } else if notifyfd.len() >= 2 {
+            // Two-digit fds cannot be dup'd by busybox ash: `exec 11>&3`
+            // dies with `exec: 11: not found`, and the prefix would kill
+            // the service before it starts (live: chronyd restart loop).
+            // Pass zinit's own fd number straight to the daemon wherever
+            // it travels as a standalone argument (`-N 11` becomes
+            // `-N $ZINIT_NOTIFY_FD`) and skip the dance entirely.
+            let mut hit = false;
+            for twin in [&mut command, &mut command_raw] {
+                if twin.contains('"') {
+                    continue;
+                }
+                let words: Vec<&str> = twin.split_whitespace().collect();
+                if words.iter().any(|&w| w == notifyfd) {
+                    *twin = words
+                        .iter()
+                        .map(|&w| {
+                            if w == notifyfd {
+                                "$ZINIT_NOTIFY_FD"
+                            } else {
+                                w
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    hit = true;
+                }
+            }
+            if !hit {
+                pre.push_str(&format!("exec {notifyfd}>&$ZINIT_NOTIFY_FD; "));
+                w!("pipefd dance kept but the fd never travels as its own argument: rewrite the daemon's flag to $ZINIT_NOTIFY_FD by hand, else this dies on busybox sh".to_string());
+            }
         } else {
             pre.push_str(&format!("exec {notifyfd}>&$ZINIT_NOTIFY_FD; "));
         }
@@ -3486,6 +3518,30 @@ mod tests {
         assert!(c.text.contains("ready = none\n"), "got:\n{}", c.text);
         assert!(c.text.contains("/usr/lib/dinit/dbus"), "got:\n{}", c.text);
         assert!(warns.join("\n").contains("print-address"), "got: {warns:?}");
+    }
+
+    #[test]
+    fn pipefd_two_digit_fd_passes_through_var() {
+        // Live (Chimera): `ready-notification = pipefd:11` with `-N 11`
+        // emitted `exec 11>&$ZINIT_NOTIFY_FD`, which busybox ash rejects
+        // (`exec: 11: not found`) — chronyd restart loop. The fd number now
+        // travels as `$ZINIT_NOTIFY_FD` and no dup prefix is emitted.
+        let dir = tmpout("pipefd11");
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /usr/bin/chronyd -n -u _chrony -N 11\nready-notification = pipefd:11\n",
+            "chronyd",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(c.text.contains("-N $ZINIT_NOTIFY_FD"), "got:\n{}", c.text);
+        assert!(!c.text.contains("exec 11>&"), "dup dance must go:\n{}", c.text);
+        assert!(c.text.contains("ready = notify\n"), "got:\n{}", c.text);
     }
 
     #[test]
