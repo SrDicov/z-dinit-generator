@@ -610,3 +610,7 @@ threads + system zombies + census every 60 min, all to
 `matrix/soak-artix.log`. Baseline sup PSS 1366 kB. P0 (fatal vs
 tolerate) deliberately NOT decided tonight — documented decision
 reserved for the morning; nothing tonight depends on it.
+
+Soak metric scope (answering tomorrow's q3 in advance): the PSS number
+is PID 71 (`zinit --sup`) alone — PID 1 is a separate `zinit` process
+and supervised children are not included.
