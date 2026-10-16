@@ -3458,7 +3458,7 @@ fn main() -> std::process::ExitCode {
                 2
             } else if z_power(&zinit_socket(None), "poweroff") {
                 0
-            } else if sysrq_power('o', verb) {
+            } else if sysrq_power(b'o', &verb) {
                 0
             } else {
                 eprintln!("z-dinit-generator: {verb} failed");
@@ -3471,7 +3471,7 @@ fn main() -> std::process::ExitCode {
                 2
             } else if z_power(&zinit_socket(None), "reboot") {
                 0
-            } else if sysrq_power('b', verb) {
+            } else if sysrq_power(b'b', &verb) {
                 0
             } else {
                 eprintln!("z-dinit-generator: reboot failed");
@@ -4701,13 +4701,16 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_types_map_to_graceful_or_nak() {
+    fn shutdown_types_map_to_supervisor_or_nak() {
+        // With no supervisor there is nobody to ask: power types NAK
+        // (the old sysrq path is gone from this arm; the CLI keeps its
+        // own loud fallback). SOFTREBOOT/KEXEC stay NAK, garbage BADREQ.
         let (server, mut client) = pair();
         let h = serve_bg(server, BTreeMap::new(), fctx(), 0);
-        // With no supervisor the list is empty: graceful trivially holds,
-        // and the sysrq file lands in /tmp (never the real trigger here).
-        client.write_all(&[SHUTDOWN, 4]).unwrap();
-        assert_eq!(read_exact(&mut client, 1), [ACK]);
+        for t in [2u8, 3, 4] {
+            client.write_all(&[SHUTDOWN, t]).unwrap();
+            assert_eq!(read_exact(&mut client, 1), [NAK], "type {t} without sup");
+        }
         client.write_all(&[SHUTDOWN, 5]).unwrap();
         assert_eq!(read_exact(&mut client, 1), [NAK]);
         client.write_all(&[SHUTDOWN, 9]).unwrap();

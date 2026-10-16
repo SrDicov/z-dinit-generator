@@ -276,13 +276,11 @@ try:
     c2.raw(bytes([27]))
     check("listenenv", c2.read(1) == bytes([50]))
     c2.raw(bytes([10, 4]))
-    check("shutdown", c2.read(1) == bytes([51]))
+    check("shutdown-reboot", c2.read(1) == bytes([50]))
     c2.raw(bytes([10, 2]))
     check("shutdown-halt", c2.read(1) == bytes([50]))
     c2.raw(bytes([10, 3]))
     check("shutdown-poweroff", c2.read(1) == bytes([50]))
-    c2.raw(bytes([10, 4]))
-    check("shutdown-reboot", c2.read(1) == bytes([50]))
     # 19. handle uniqueness across connections (close idle first:
     # one connection is served at a time, like upstream).
     c2.close()
@@ -299,6 +297,6 @@ try:
     if fails:
         print("FAILURES: %s" % fails)
         sys.exit(1)
-    print("proto: %d checks ok" % 43)
+    print("proto: %d checks ok" % 42)
 finally:
     proc.terminate()
