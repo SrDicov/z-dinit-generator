@@ -674,3 +674,36 @@ dinitctl); parity dinit⊆zinit PERFECT (0 missing, 29 extra = shim+tree).
 Soak relaunched 07:06Z on pre-P0 binary (baseline sup=71 PSS=948kB
 fds=79) — clock runs; verdict due tomorrow, cannot close today.
 Docs: MIGRATING.md dinit road, KNOWN_ISSUES.md, CONTRIBUTING.md pushed.
+
+## 2026-10-16 — P1 WINDOW CLOSED (live handoff dinit→zinit, 08:05Z)
+
+Coexistence (dinit PID1 + zinit sup as its child, 94 svcs, 0 failed,
+dinitctl→compatd by design, parity dinit⊆zinit 0-missing) held 30min.
+Handoff, all verified live:
+- `zctl stop compatd` + `rm -f /run/dinitctl` + `kill -USR1 1` brings
+  REAL dinit back (0.22.0 reopens its socket; new socket perms
+  srw------- vs compatd's srwxr-xr-x prove ownership; 65 svcs).
+  (First attempt without rm failed: stale compatd socket blocks.)
+- `dinitctl stop boot` (no force needed) rolls back dinit's whole
+  tree (21 children → 1, the sup), ordered, in seconds.
+- zinit's restart loops bind freed ports by themselves: sshd 34
+  attempts through EADDRINUSE then bound :22 (pid 2046, child of sup);
+  current ssh session IS zinit-served. Kicks unneeded ("nothing to
+  kick"). dbus/serial held steady. Zombies 0 throughout.
+- `pacman -R dinit` refused (deps: *-dinit pkgs); `-Rdd` removed it.
+  /usr/bin/dinit persists (owned by dinit-base, left deliberately —
+  PID1 runs from RAM, P2 replaces it). dinit pkg gone (QRC=1).
+- /sbin/init flipped to zinit-init + sync (P2 boots default path).
+- First window attempt failed instructively: logs went to /tmp
+  (tmpfs, vaporized by the kill-9) and ssh never returned because
+  zinit's sshd was dep-held (never attempted, restarts=0) — replay
+  with /root logs showed the cascade had converged and sshd was
+  fighting properly (8/3). Lesson: logs to /root, verify fighters
+  (restarts>0) BEFORE stopping dinit.
+- dinit SIGTERM = halt (man: system-manager TERM stops+halts), NOT a
+  handoff path. USR1-reopen + stop-boot is the surgical path.
+1h window runs 08:05→09:05Z (zinit-serving, dinit packageless+idle),
+then P2 (qemu relaunch without init=, PID1=zinit expected).
+Packaging fixes pushed: dinitctl shim untracked (post_install),
+co-installable, no provides (would forbid P1); zinit PKGBUILD added.
+Release smoke dispatched (run 38871921962).
