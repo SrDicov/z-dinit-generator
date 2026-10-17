@@ -1,0 +1,27 @@
+name: dinit-reference
+on: [push, pull_request]
+jobs:
+  ground-truth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
+    steps:
+      - name: boot real dinit
+        run: |
+          docker pull chimeralinux/chimera:latest
+          docker run -d --name ref -e PKGS chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && exec /sbin/dinit'
+          sleep 25
+          docker exec ref dinitctl list | tee reference-states.txt || true
+          docker exec ref sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " <$p 2>/dev/null | cut -c1-80; echo; done' | sort | uniq -c | sort -rn | tee reference-ps.txt
+          docker logs ref >reference-log.txt 2>&1 || true
+          docker rm -f ref
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dinit-reference
+          path: |
+            reference-states.txt
+            reference-ps.txt
+            reference-log.txt

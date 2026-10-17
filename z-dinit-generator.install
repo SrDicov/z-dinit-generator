@@ -1,0 +1,15 @@
+# dinitctl shim arrives here, not in the package: dinit owns
+# /usr/bin/dinitctl until `pacman -R dinit`, and a tracked file would
+# break co-installation (the whole P1 transition). Untracked symlink,
+# created only when nothing provides the name, removed only if ours.
+post_install() {
+  if [ ! -e /usr/bin/dinitctl ]; then
+    ln -s z-dinit-generator /usr/bin/dinitctl
+  fi
+}
+
+post_remove() {
+  if [ -L /usr/bin/dinitctl ] && [ "$(readlink /usr/bin/dinitctl)" = z-dinit-generator ]; then
+    rm -f /usr/bin/dinitctl
+  fi
+}

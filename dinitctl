@@ -1,0 +1,43 @@
+#!/bin/sh
+# dinitctl — dinit CLI emulator over zinit C4, through zctl.
+# Faithful where C4 reaches, loud where it does not: setenv/unsetenv are
+# accepted no-ops (zinit has no activation environment; boot-detection
+# vars like DINIT_CONTAINER are snapshotted into the supervisor env at
+# launch instead). trigger/wake have no counterpart and fail openly.
+# Anything else passes to `zctl status/list/start/stop/restart` verbatim.
+# Exit: 0 ok, 1 usage/error/unimplemented. POSIX sh.
+set -eu
+p=dinitctl
+warn() { printf '%s: %s\n' "$p" "$*" >&2; }
+ZCTL=${ZCTL:-zctl}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --use-passed-cfd) shift;;
+        --) shift; break;;
+        -*) warn "unknown flag $1"; exit 1;;
+        *) break;;
+    esac
+done
+[ $# -ge 1 ] || { printf 'usage: %s <status|list|start|stop|restart|is-started|is-failed|setenv|unsetenv> [args]\n' "$p" >&2; exit 1; }
+cmd=$1; shift
+case "$cmd" in
+    setenv|unsetenv)
+        warn "$cmd $* (no activation environment under zinit; ignored)"
+        exit 0;;
+    status|list|start|stop|restart)
+        exec "$ZCTL" "$cmd" "$@";;
+    is-started)
+        [ $# -eq 1 ] || { warn "usage: $p is-started <svc>"; exit 1; }
+        out=$("$ZCTL" status "$1" 2>/dev/null) || exit 1
+        case "$out" in *" running "*) exit 0;; *) exit 1;; esac;;
+    is-failed)
+        [ $# -eq 1 ] || { warn "usage: $p is-failed <svc>"; exit 1; }
+        out=$("$ZCTL" status "$1" 2>/dev/null) || exit 1
+        case "$out" in *" stopped desired=up "*) ;; *) exit 1;; esac
+        r=${out##*restarts=}; r=${r%% *}
+        [ "${r%%/*}" -ge "${r##*/}" ] && [ "${r##*/}" -gt 0 ];;
+    trigger|wake)
+        warn "$cmd: no trigger concept under zinit; use start"
+        exit 1;;
+    *) warn "unknown command $cmd"; exit 1;;
+esac
