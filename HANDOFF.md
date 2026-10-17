@@ -892,3 +892,17 @@ per-session manager, not system init).
   dead pid with up>0s ever reappears). Cleanup done: staleprobe + logs
   removed, plan back to 97 (24 running / 73 stopped / 0 failed), 0 zombies.
 - chronyd: 13+ min running, restarts pinned at 0/3 on the new binary.
+
+## 2026-10-16 ~20:05Z — REMOVAL ATTEMPT: self-lockout
+- Deployed a PID1-aware /sbin/poweroff shim + dinitctl shim + pinned
+  compatd/dinit-watch/dinit-dbus down via drop-ins. Then issued
+  `doas /sbin/reboot`. Box is dark 10+ min: tailnet + LAN both down.
+- Likely cause: the shim's zinit branch (`/sbin/zctl reboot`) ran because
+  the box had booted into zinit from the prior one-shot; but that boot's
+  sup socket may have been gone (sup killed during the user-session
+  migration), so zctl failed and no kernel reboot happened.
+- Recovery needs physical power cycle: hold 5s, let it boot dinit, SSH in,
+  restore /root/dinit-orig/sbin/shutdown.real to the four applets, inspect.
+- Do NOT retry removal until the shim is proven under both inits, and until
+  the cold-boot flip is decided (so there is no "under dinit" case to
+  handle).
