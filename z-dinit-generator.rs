@@ -569,6 +569,7 @@ fn convert_one(
     let mut extra_rl: Vec<String> = Vec::new();
     let mut extra_cg = String::new();
     let mut extra_tty = String::new();
+    let mut extra_caps: Vec<String> = Vec::new();
 
     for ln in gather_lines(file_text, in_dir, 0, n, warns) {
         if has_bare_hash(&ln) {
@@ -730,7 +731,9 @@ fn convert_one(
                 for o in v.split_whitespace() {
                     match o {
                         "always-chain" => chainalways = true,
-                        "runs-on-console" => run_console = true,
+                        // dinit 0.19+ spells it `starts-on-console`; older
+                        // files say `runs-on-console`. Both mean the same.
+                        "runs-on-console" | "starts-on-console" => run_console = true,
                         // inherent: the child path always sets no-new-privs.
                         "no-new-privs" => {}
                         // dinit passes its control-socket fd; under
@@ -834,8 +837,43 @@ fn convert_one(
                     extra_cg = format!("cgroup = {v}");
                 }
             }
-            "capabilities" | "securebits" => {
-                w!(format!("{k} ignored; only dropping is supported, never granting"));
+            "capabilities" => {
+                // dinit restricts the *permitted* set to what is listed, and an
+                // empty list drops everything. zinit can only ever drop, never
+                // grant, so "drop everything" maps exactly and "keep this list"
+                // does not.
+                let kept: Vec<&str> = v.split_whitespace().collect();
+                if kept.is_empty() {
+                    extra_caps.push("drop-capabilities = all".to_string());
+                } else {
+                    // Keeping this wrong would be a security regression dressed
+                    // as a warning: the converted service would run with *more*
+                    // capability than dinit gave it. The file carries the
+                    // directive verbatim, which `zinit check` refuses as an
+                    // unknown key, so the operator maps the complement by hand
+                    // instead of inheriting a wider door.
+                    extra_caps.push(format!(
+                        "# dinit kept [{}]; zinit can only drop, so this needs a manual\n\
+                         # mapping: drop-capabilities = <every capability except the ones above>\n\
+                         capabilities = {v}",
+                        kept.join(" ")
+                    ));
+                    w!(format!(
+                        "capabilities [{v}] cannot be expressed: zinit only drops. The converted \
+                         file keeps the directive so `zinit check` refuses it; map it by hand"
+                    ));
+                }
+            }
+            "securebits" => {
+                extra_caps.push(format!(
+                    "# securebits [{v}] has no zinit equivalent: the converted service does not\n\
+                     # get this hardening, so `zinit check` refuses the file until it is resolved\n\
+                     securebits = {v}"
+                ));
+                w!(format!(
+                    "securebits [{v}] has no zinit equivalent; the converted file keeps the \
+                     directive so `zinit check` refuses it instead of running weaker"
+                ));
             }
             "ioprio" | "oom-score-adj" => w!(format!("{k} ignored")),
             "inittab-id" | "inittab-line" => w!(format!("{k} ignored; no utmp accounting")),
@@ -1142,6 +1180,9 @@ fn convert_one(
     }
     if !extra_cg.is_empty() {
         o.push_str(&format!("{extra_cg}\n"));
+    }
+    for e in &extra_caps {
+        o.push_str(&format!("{e}\n"));
     }
     if zt_owned == "forking" && !pid.is_empty() {
         o.push_str(&format!("pid-file = {pid}\n"));
@@ -4210,6 +4251,91 @@ mod tests {
         assert_eq!(cook_value(&ll[0].0), "command = a b");
         assert_eq!(ll[1].1, false);
         assert_eq!(sub_arg1("/bin/s $1 ${1} ${1:-x}", "s", &mut Vec::new()), "/bin/s %i %i %i");
+    }
+
+    /// dinit's `capabilities =` (empty) means "drop everything", which zinit
+    /// spells `all`; a non-empty list cannot be expressed because zinit only
+    /// drops, and guessing the complement is how a service ends up with more
+    /// privilege than the file it came from.
+    #[test]
+    fn capabilities_are_dropped_or_refused_never_widened() {
+        let dir = std::env::temp_dir().join(format!("zdg-caps-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let conv = |text: &str| {
+            let mut pulls = BTreeMap::new();
+            let mut befores = Vec::new();
+            let mut warns = Vec::new();
+            let c = convert_one(text, "svc", &dir, &mut pulls, &mut befores, &mut warns)
+                .expect("converts");
+            (c.text, warns)
+        };
+
+        let (text, warns) = conv("type = process\ncommand = /bin/s\ncapabilities =\n");
+        assert!(
+            text.contains("drop-capabilities = all\n"),
+            "an empty dinit set must become `all`: {text}"
+        );
+        assert!(
+            !warns.iter().any(|w| w.contains("capabilities")),
+            "dropping everything is exact, not a warning: {warns:?}"
+        );
+
+        let (text, warns) = conv(
+            "type = process\ncommand = /bin/s\ncapabilities = CAP_NET_BIND_SERVICE\n",
+        );
+        assert!(
+            text.contains("capabilities = CAP_NET_BIND_SERVICE\n"),
+            "the un-mappable directive must stay so `zinit check` refuses it: {text}"
+        );
+        // The *comment* names `drop-capabilities` to say what is missing; what
+        // must not exist is an active directive, because a guessed complement
+        // is exactly the "more privilege than dinit" bug this mapping avoids.
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim_start().starts_with("drop-capabilities =")),
+            "guessing a complement is forbidden: {text}"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("cannot be expressed")),
+            "the loss must be loud: {warns:?}"
+        );
+
+        let (text, warns) = conv("type = process\ncommand = /bin/s\nsecurebits = NOROOT\n");
+        assert!(text.contains("securebits = NOROOT\n"), "{text}");
+        assert!(
+            warns.iter().any(|w| w.contains("no zinit equivalent")),
+            "{warns:?}"
+        );
+    }
+
+    /// `starts-on-console` is the current spelling; it must not fall through
+    /// to the generic "option ignored" branch.
+    #[test]
+    fn starts_on_console_is_recognised() {
+        let dir = std::env::temp_dir().join(format!("zdg-console-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut pulls = BTreeMap::new();
+        let mut befores = Vec::new();
+        let mut warns = Vec::new();
+        let c = convert_one(
+            "type = process\ncommand = /sbin/agetty\noptions = starts-on-console\n",
+            "getty",
+            &dir,
+            &mut pulls,
+            &mut befores,
+            &mut warns,
+        )
+        .expect("converts");
+        assert!(
+            c.text.contains("type = console\n"),
+            "starts-on-console must make it a console service: {}",
+            c.text
+        );
+        assert!(
+            !warns.iter().any(|w| w.contains("starts-on-console")),
+            "recognised options must not warn: {warns:?}"
+        );
     }
 
     #[test]
