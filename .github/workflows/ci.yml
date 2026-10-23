@@ -1,0 +1,176 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  compatd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build and test (std only, no cargo)
+        run: |
+          rustc --test -D warnings --edition=2021 compatd.rs -o /tmp/compatd-test
+          /tmp/compatd-test
+          rustc -O -D warnings --edition=2021 compatd.rs -o /tmp/compatd
+          rustc --test -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg-test
+          /tmp/zdg-test
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: z-dinit-generator-linux-x86_64
+          path: /tmp/zdg
+          if-no-files-found: error
+          retention-days: 14
+      - name: parity sh vs rust
+        run: |
+          rm -rf in out-sh out-rs && mkdir in out-sh out-rs
+          printf 'type = process\ncommand = /usr/sbin/sshd -D\ndepends-on = net\ndepends-ms = log\nrestart = true\nstop-timeout = 5\n' > in/sshd
+          printf 'type = scripted\ncommand = /s/fs.sh\nrestart = false\n' > in/fs
+          printf 'type = internal\ndepends-on = sshd\n' > in/boot
+          printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
+          printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
+          printf 'type = process\ncommand = /bin/sleep 300\nstop-command = /bin/echo bye\n' > in/graceful
+          printf 'type = process\ncommand = /bin/true\nrestart = false\nchain-to = done2\n' > in/chainer
+          printf 'type = scripted\ncommand = /bin/true\nstop-command = /bin/echo x\nchain-to = done2\n' > in/ochain
+          printf 'type = internal\n' > in/boot2
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/lonely
+          ./dinit-import.sh in out-sh 2>/dev/null
+          /tmp/zdg convert in out-rs 2>/dev/null
+          diff -r out-sh out-rs && echo "parity: byte-identical"
+      - name: start live path on fake system dirs
+        run: |
+          sudo mkdir -p /usr/lib/dinit.d /etc/dinit.d
+          printf 'type = process\ncommand = /bin/sleep 300\n' | sudo tee /usr/lib/dinit.d/base >/dev/null
+          printf 'type = process\ncommand = /bin/sleep 300\ndepends-on = base\n' | sudo tee /etc/dinit.d/top >/dev/null
+          printf 'type = internal\ndepends-on = top\n' | sudo tee /etc/dinit.d/boot >/dev/null
+          sudo rm -rf /tmp/prove-out
+          /tmp/zdg start --out /tmp/prove-out
+          test -f /tmp/prove-out/top.conf
+          test -f /tmp/prove-out/compatd.conf
+          test -f /tmp/prove-out/dinit-watch.conf
+          grep -q '^depends = base$' /tmp/prove-out/top.conf
+          grep -q 'compatd' /tmp/prove-out/compatd.conf
+          sudo rm -f /usr/lib/dinit.d/base /etc/dinit.d/top /etc/dinit.d/boot
+          echo "start: live path ok"
+      - name: watch retranslates without manual convert
+        run: |
+          rm -rf win wout && mkdir win wout
+          printf 'type = process\ncommand = /bin/sleep 300\n' > win/a
+          ZINIT_SOCKET=/tmp/zdg-no-such-sock /tmp/zdg watch win wout 2>watch.log &
+          WPID=$!
+          sleep 3
+          test -f wout/a.conf
+          printf 'type = process\ncommand = /bin/sleep 300\n' > win/b
+          sleep 5
+          test -f wout/b.conf || { echo "watch did not pick up b"; kill $WPID; exit 1; }
+          kill $WPID
+          echo "watch: mode 2 ok"
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: syntax
+        run: |
+          sh -n dinit-import.sh
+          sh -n dinitctl
+          sh test/test-dinitctl.sh
+          bash -n PKGBUILD
+          python3 -m py_compile chimera-template.py && echo "templates ok"
+      - name: fixtures
+        run: |
+          rm -rf in out && mkdir in out
+          printf 'type = process\ncommand = /usr/sbin/sshd -D\ndepends-on = net\ndepends-ms = log\nrestart = true\nstop-timeout = 5\n' > in/sshd
+          printf 'type = scripted\ncommand = /s/fs.sh\nrestart = false\n' > in/fs
+          printf 'type = internal\ndepends-on = sshd\n' > in/boot
+          printf 'type = bgprocess\ncommand = /usr/bin/mysqld\npid-file = /run/m.pid\n' > in/mysql
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/net
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/log
+          printf 'type = process\ncommand = /bin/daemon\ndepends-ms = net\nbefore = log\nready-notification = pipefd:5\n' > in/notifier
+          printf 'type = process\ncommand = /bin/sleep 300\nstop-command = /bin/echo bye\n' > in/graceful
+          printf 'type = process\ncommand = /bin/true\nrestart = false\nchain-to = done2\n' > in/chainer
+          printf 'type = scripted\ncommand = /bin/true\nstop-command = /bin/echo x\nchain-to = done2\n' > in/ochain
+          printf 'type = internal\n' > in/boot2
+          printf 'type = process\ncommand = /bin/sleep 300\n' > in/lonely
+          ./dinit-import.sh in out 2>warn.txt || exit 1
+          grep -q 'chain-to needs a shell' warn.txt
+          grep -q 'stop-command needs a shell' warn.txt
+          grep -q '^type = process$' out/sshd.conf
+          grep -q '^depends = net, log$' out/sshd.conf
+          grep -q '^restart = always$' out/sshd.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/sshd.conf
+          grep -q '^log = none$' out/sshd.conf
+          grep -q '^stop-timeout = 5s$' out/sshd.conf
+          grep -q '^type = oneshot$' out/fs.conf
+          grep -q '^command = true$' out/boot.conf
+          grep -q '^depends = sshd$' out/boot.conf
+          grep -q '^pid-file = /run/m.pid$' out/mysql.conf
+          grep -q '^restart = always$' out/mysql.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/mysql.conf
+          grep -q '^depends = net$' out/notifier.conf
+          grep -q '^depends = after:notifier$' out/log.conf
+          grep -q '^ready = notify$' out/notifier.conf
+          grep -q '^command = exec 5>&\$ZINIT_NOTIFY_FD; exec /bin/daemon$' out/notifier.conf
+          grep -q '^restart = always$' out/notifier.conf
+          grep -q '^restart-budget = 3 restarts per 10s$' out/notifier.conf
+          grep -q '^type = script$' out/graceful.conf
+          grep -qF "trap '/bin/echo bye' TERM; /bin/sleep 300" out/graceful.conf
+          grep -q '^type = script$' out/chainer.conf
+          grep -qF 'zctl start done2' out/chainer.conf
+          grep -q '^type = oneshot$' out/ochain.conf
+          grep -q '^command = /bin/true$' out/ochain.conf
+          ! grep -q '^restart' out/boot.conf
+          grep -q '^enabled = no$' out/lonely.conf
+          grep -q '^enabled = no$' out/mysql.conf
+          ! grep -q '^enabled' out/sshd.conf
+          ! grep -q '^enabled' out/boot.conf
+      - name: c1
+        run: |
+          # after: syntax needs a post-v0.0.2 sup: consume the latest
+          # CI-green testing artifact until the next release re-pins a version.
+          ZRUN=$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')
+          test -n "$ZRUN" || { echo NO_GREEN_ZINIT; exit 1; }
+          gh run download "$ZRUN" -R SrDicov/zinit --name zinit-linux-x86_64-glibc --dir zfresh
+          ./zfresh/zinit check out
+        env:
+          GH_TOKEN: ${{ github.token }}
+  keys:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: raw protocol conformance on the real binary
+        run: |
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+          python3 test/test-proto.py /tmp/zdg
+      - name: new directives convert and check
+        run: |
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+          rm -rf kin kout && mkdir kin kout
+          printf 'type = process\ncommand = /bin/srv $1\ndepends-on = net\nrestart-limit-count = 5\nrestart-limit-interval = 20\nrestart-delay = 0.5\nsocket-listen = /run/s.sock\nrun-in-cgroup = /sys/fs/cgroup/sys\nrlimit-nofile = 1024:4096\noptions: runs-on-console no-new-privs\nload-options: export-service-name\n' > kin/svc
+          printf 'type = process\ncommand = /bin/daemon\nready-notification = pipevar:READY_FD\n' > kin/notifier
+          printf 'type = process\ncommand = /bin/sleep 300\n' > kin/net
+          printf 'type = internal\ndepends-on = svc\n' > kin/boot
+          /tmp/zdg convert kin kout
+          echo CONVERT_OK
+          cat kout/svc.conf
+          cat -A kout/svc.conf | head -n 3
+          grep -q '^type = console$' kout/svc.conf || { echo "MISS: ^type = console$ in kout/svc.conf"; exit 1; }
+          grep -q '^command = /bin/srv %i$' kout/svc.conf || { echo "MISS: ^command = /bin/srv %i$ in kout/svc.conf"; exit 1; }
+          grep -q '^restart-budget = 5 restarts per 20s$' kout/svc.conf || { echo "MISS: ^restart-budget = 5 restarts per 20s$ in kout/svc.conf"; exit 1; }
+          grep -q '^restart-delay = 500ms$' kout/svc.conf || { echo "MISS: ^restart-delay = 500ms$ in kout/svc.conf"; exit 1; }
+          grep -q '^tty = /dev/console$' kout/svc.conf || { echo "MISS: ^tty = /dev/console$ in kout/svc.conf"; exit 1; }
+          grep -q '^listen = unix:/run/s.sock$' kout/svc.conf || { echo "MISS: ^listen = unix:/run/s.sock$ in kout/svc.conf"; exit 1; }
+          grep -q '^cgroup = /sys/fs/cgroup/sys$' kout/svc.conf || { echo "MISS: ^cgroup = /sys/fs/cgroup/sys$ in kout/svc.conf"; exit 1; }
+          grep -q '^rlimit-nofile = 1024$' kout/svc.conf || { echo "MISS: ^rlimit-nofile = 1024$ in kout/svc.conf"; exit 1; }
+          grep -q '^type = script$' kout/notifier.conf || { echo "MISS: ^type = script$ in kout/notifier.conf"; exit 1; }
+          grep -qF 'export READY_FD="$ZINIT_NOTIFY_FD"' kout/notifier.conf || { echo "MISS: export READY_FD="$ZINIT_NOTIFY_FD" in kout/notifier.conf"; exit 1; }
+          grep -q '^ready = notify$' kout/notifier.conf || { echo "MISS: ^ready = notify$ in kout/notifier.conf"; exit 1; }
+          grep -q '^env = DINIT_SERVICE=svc$' kout/svc.conf || { echo "MISS: ^env = DINIT_SERVICE=svc$ in kout/svc.conf"; exit 1; }
+          gh run download "$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')" -R SrDicov/zinit --name zinit-linux-x86_64-glibc --dir zfresh || { echo DOWNLOAD_FAILED; exit 1; }
+          echo "--- svc.conf ---"
+          cat kout/svc.conf
+          echo "--- check ---"
+          ./zfresh/zinit check kout
+        env:
+          GH_TOKEN: ${{ github.token }}

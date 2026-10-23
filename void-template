@@ -1,0 +1,21 @@
+# Template file for 'z-dinit-generator'
+pkgname=z-dinit-generator
+version=0.1.0
+revision=1
+build_style=meta
+hostmakedepends="rust"
+depends="zinit"
+short_desc="Perfect dinit replacement frontend for zinit"
+maintainer="SrDicov <dicov@localhost>"
+license="GPL-3.0-or-later"
+homepage="https://github.com/SrDicov/z-dinit-generator"
+distfiles="https://github.com/SrDicov/z-dinit-generator/archive/v${version}.tar.gz"
+checksum=SKIP
+
+do_build() {
+	rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o z-dinit-generator
+}
+do_install() {
+	vbin z-dinit-generator
+	ln -sf z-dinit-generator ${DESTDIR}/usr/bin/dinitctl
+}

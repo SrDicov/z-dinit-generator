@@ -1,0 +1,105 @@
+name: chimera-e2e
+on: [push, pull_request]
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PKGS: dinit openssh openssh-dinit dbus dbus-dinit dbus-dinit-links chrony chrony-dinit cronie cronie-dinit
+      # after: syntax needs a post-v0.0.2 sup: consume the latest CI-green
+      # testing musl artifact until the next release re-pins a version.
+      # check runs inside the container because user= names only resolve
+      # where the packages installed them.
+      ZINIT_MUSL: zinit-musl-x86_64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: corpus
+        run: |
+          docker pull chimeralinux/chimera:latest
+          rm -rf corpus && mkdir corpus
+          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && for d in /etc/dinit.d /usr/lib/dinit.d; do [ -d "$d" ] && { mkdir -p "/work/corpus/$(basename $d)"; cp -r "$d"/* "/work/corpus/$(basename $d)/"; }; done; cp -r /usr/lib/dinit.d/early/scripts /work/corpus-scripts 2>/dev/null; find /work/corpus -type f -o -type l | wc -l'
+          test "$(find corpus -type f | wc -l)" -gt 0
+      - name: translate
+        run: |
+          rustc -O -D warnings --edition=2021 z-dinit-generator.rs -o /tmp/zdg
+          rm -rf out out-rs && mkdir out out-rs && rm -f warn.log && touch warn.log
+          for d in corpus/*/; do ./dinit-import.sh "$d" out 2>>warn.log || exit 1; done
+          for d in corpus/*/; do /tmp/zdg convert "$d" out-rs 2>/dev/null || exit 1; done
+          echo "files=$(find corpus -type f | wc -l) generated=$(ls out | wc -l) rust=$(ls out-rs | wc -l)"
+          sort warn.log | uniq -c | sort -rn | head -20
+      - name: c1
+        run: |
+          ZRUN=$(gh run list -R SrDicov/zinit --branch testing --workflow ci.yml --limit 20 --json databaseId,conclusion --jq '[.[] | select(.conclusion=="success")][0].databaseId')
+          test -n "$ZRUN" || { echo NO_GREEN_ZINIT; exit 1; }
+          gh run download "$ZRUN" -R SrDicov/zinit --name "$ZINIT_MUSL" --dir zmusl
+          docker run --rm -e PKGS -v "$PWD:/work" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && /work/zmusl/zinit check /work/out && exec /work/zmusl/zinit check /work/out-rs'
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: boot
+        run: |
+          rm -rf payload && mkdir payload
+          cp zmusl/zinit zmusl/zctl payload/
+          cp z-dinit-generator.rs payload/
+          cp -r out payload/out
+          printf 'type = process\ncommand = /z/z-dinit-generator compatd\nrestart = always\nrestart-budget = 3 restarts per 10s\nlog = none\nready = none\n' > payload/out/compatd.conf
+          if [ -f payload/out/early-devmon.conf ]; then
+            if grep -q '^depends = ' payload/out/early-devmon.conf; then
+              sed -i 's/^depends = /depends = compatd, /' payload/out/early-devmon.conf
+            else
+              printf 'depends = compatd\n' >> payload/out/early-devmon.conf
+            fi
+          fi
+          docker run --rm -v "$PWD/payload:/z" chimeralinux/chimera:latest \
+            sh -c 'apk update >/dev/null && apk add rust >/dev/null && rustc -O --edition=2021 /z/z-dinit-generator.rs -o /z/z-dinit-generator && cp /z/z-dinit-generator /z/dinitctl && rm /z/z-dinit-generator.rs'
+          docker run -d --name zb --cap-add SYS_TIME --cap-add SYS_NICE \
+            -e PKGS -e ZINIT_CONFIG_DIRS=/z/out -e ZINIT_SOCKET=/z/ctl -e ZINIT_STATE_DIR=/z/state \
+            -v "$PWD/payload:/z" \
+            chimeralinux/chimera:latest sh -c 'apk update >/dev/null && apk add $PKGS >/dev/null && mv /usr/bin/dinitctl /usr/bin/dinitctl.real && cp /z/dinitctl /usr/bin/dinitctl && chmod +x /usr/bin/dinitctl && exec /z/zinit --init'
+          sleep 20
+          for i in $(seq 1 24); do
+            docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status boot 2>/dev/null | grep -q completed && break
+            sleep 5
+          done || true
+          sleep 10
+          test "$(docker inspect -f '{{.State.Running}}' zb)" = true
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl list | tee states.txt
+          for s in sshd dbus-daemon chronyd crond udevd uuidd boot system early-env early-devmon device local.target early-cryptdisks compatd; do docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status "$s"; done | tee status.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/dinitctl is-started compatd | tee dctl-probe.txt
+          grep -q 'STARTED' dctl-probe.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/dinitctl list | tee dctl-list.txt
+          grep -q 'compatd' dctl-list.txt
+          docker exec zb sh -c 'test -S /run/dinitctl && echo compatd-sock-ok' | tee compatd-sock.txt
+          grep -q 'compatd-sock-ok' compatd-sock.txt
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status compatd | grep -q ' running '
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl status early-devmon | tee devmon.txt
+          grep -q ' running ' devmon.txt
+          docker exec zb sh -c "printf 'type = script\ncommand = echo ok > /z/probe.done\nready = none\nrestart = never\nlog = none\n' > /z/out/probe.conf"
+          docker exec -e ZINIT_SOCKET=/z/ctl zb /z/zctl reload-all
+          sleep 5
+          docker exec zb cat /z/probe.done | tee probe.txt
+          grep -q '^ok$' probe.txt
+          docker exec zb sh -c '/usr/bin/chronyd -n -u _chrony -N 11 >/tmp/chrony.out 2>&1 & p=$!; sleep 6; kill -9 $p 2>/dev/null; cat /tmp/chrony.out' 2>&1 | head -15 || true
+          docker logs zb >zb.log 2>&1 || true
+          tail -5 zb.log
+          docker rm -f zb
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chimera-e2e
+          path: |
+            corpus
+            out
+            out-rs
+            warn.log
+            states.txt
+            status.txt
+            compatd-sock.txt
+            devmon.txt
+            dctl-probe.txt
+            dctl-list.txt
+            probe.txt
+            zb.log
+            corpus-scripts
